@@ -18,6 +18,7 @@
 
 #include "BlockStream.h"
 #include "NNPIOptions.h"
+#include "glow/Backend/BlockStreamBase.h"
 #include "glow/Backend/CompiledFunction.h"
 #include "glow/Backends/BackendOptions.h"
 #include "glow/ExecutionContext/ExecutionContext.h"
@@ -67,22 +68,6 @@ struct NNPICompilationInfo {
   }
 };
 
-/// SLS validation information
-struct ValidateSLSInfo {
-  bool isEmbeddingBag;
-  size_t tableHeight;
-  Placeholder *indices;
-  Placeholder *weights;
-  Placeholder *lengths;
-  Placeholder *offsets;
-  ValidateSLSInfo(bool isEmbeddingBag_, size_t tableHeight_,
-                  Placeholder *indices_, Placeholder *weights_,
-                  Placeholder *lengths_, Placeholder *offsets_)
-      : isEmbeddingBag(isEmbeddingBag_), tableHeight(tableHeight_),
-        indices(indices_), weights(weights_), lengths(lengths_),
-        offsets(offsets_) {}
-};
-
 /// Function "compiled" for execution by the NNPI backend.
 class NNPICompiledFunction final : public CompiledFunction {
 public:
@@ -119,11 +104,6 @@ public:
     return partialInputs_;
   }
 
-  /// \returns a reference to the set SLS parameter Placeholders to validate.
-  const std::vector<ValidateSLSInfo> &getValidateSLSInputs() const {
-    return validateSLSInputs_;
-  }
-
   /// \returns a reference to the set of Placeholders that needed to be padded.
   /// This set is introduced because we need to pad some tensors with its last
   /// element instead of zeros. In the future, we may introduce a flag to
@@ -145,12 +125,10 @@ public:
 
   virtual Error compile(Function *F, const BackendOptions &opts);
 
-  void findSLSInputs(Function *F);
-
 #if FACEBOOK_INTERNAL
   Error compileFX(const folly::dynamic &FXIR, const std::string &submod,
                   const llvm::StringMap<const void *> &constants,
-                  const BackendOptions &opts);
+                  const BackendOptions &opts, Module *glowModule);
 #endif
 
   NNPICompilationOptions getCompilationOptions() const {
@@ -175,11 +153,20 @@ public:
     return iaExtensionPaths_;
   }
 
+  const std::vector<std::pair<std::string, std::vector<char>>> &
+  getIAExtensionLibs() const {
+    return iaExtensionLibs_;
+  }
+
   const NNPICompilationInfo &getCompilationInfo() const {
     return compilationInfo_;
   }
 
   const std::string toJSON() const override;
+
+  std::unique_ptr<BlockStreamBase> serialize() override;
+
+  Error deserialize(const std::vector<char> &serializedData) override;
 
 private:
   NNPINetwork network_;
@@ -187,7 +174,6 @@ private:
   BlockStream compiledStream_;
   std::mutex compiledStreamMutex_;
   std::unordered_set<const Placeholder *> partialInputs_;
-  std::vector<ValidateSLSInfo> validateSLSInputs_;
   std::unordered_set<const Placeholder *> paddedInputs_;
   std::unordered_set<const Placeholder *> staticInputs_;
   NNPICompilationOptions compilationOptions_;
@@ -196,6 +182,7 @@ private:
   std::vector<std::string> outputNames_;
   NNPIDeviceNetworkConfig devNetConfig_;
   std::vector<std::string> iaExtensionPaths_;
+  std::vector<std::pair<std::string, std::vector<char>>> iaExtensionLibs_;
   NNPICompilationInfo compilationInfo_;
 
   Error

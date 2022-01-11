@@ -459,6 +459,36 @@ static bool verifyBatchNormalization(NodeValue src, NodeValue dest,
   return isValid;
 }
 
+static bool verifyInstanceNormalization(NodeValue src, NodeValue dest,
+                                        NodeValue bias, NodeValue scale,
+                                        unsigned_t channel) {
+  const Node *parent = dest.getNode();
+  bool isValid = true;
+  if (src.getType()->isQuantizedType()) {
+    isValid &= checkType(src, dest.getElementType(), dest.getNode());
+    isValid &= checkSameShape(src, dest, parent);
+  } else {
+    isValid &= checkSameType(src, dest, parent);
+  }
+
+  isValid &= expectCompareTrue(
+      "Require at least two input dims i.e., batch and channel dimensions",
+      src.dims().size(), (size_t)1, parent,
+      CompareOperatorGreaterThan<size_t>());
+
+  // Figure out how many channels are in the tensor.
+  dim_t channels = src.dims()[channel];
+
+  const dim_t expArray[] = {channels};
+  auto exp = llvm::makeArrayRef(expArray);
+  isValid &= expectCompareTrue("Invalid bias dimension", bias.getType()->dims(),
+                               exp, parent);
+  isValid &= expectCompareTrue("Invalid scale dimension",
+                               scale.getType()->dims(), exp, parent);
+
+  return isValid;
+}
+
 static bool verifyActivation(NodeValue src, NodeValue dest) {
   const Node *parent = dest.getNode();
   bool isValid = checkSameIsQuantized(src.getType(), dest.getType(), parent);
@@ -1308,6 +1338,11 @@ bool BatchNormalizationNode::verify() const {
                                   getScale(), getMean(), getVar(), ChannelIdx_);
 }
 
+bool InstanceNormalizationNode::verify() const {
+  return verifyInstanceNormalization(getInput(), getResult(), getBias(),
+                                     getScale(), ChannelIdx_);
+}
+
 bool LayerNormalizationNode::verify() const {
   auto dest = getResult();
   auto src = getInput();
@@ -1805,15 +1840,37 @@ bool LengthsRangeFillNode::verify() const {
   return isValid;
 }
 
-bool SparseToDenseNode::verify() const {
+bool BatchSparseToDenseNode::verify() const {
   bool isValid = checkType(getResult(), getValues().getElementType(), this);
   isValid &=
       checkType(getIndices(), {ElemKind::Int64ITy, ElemKind::Int32ITy}, this);
+  isValid &=
+      checkType(getLengths(), {ElemKind::Int64ITy, ElemKind::Int32ITy}, this);
+  isValid &= expectCompareTrue("Lengths must be a 1D vector",
+                               getLengths().dims().size(), size_t(1), this);
   isValid &= expectCompareTrue("Indices must be a 1D vector",
                                getIndices().dims().size(), size_t(1), this);
-  isValid &=
-      expectCompareTrue("Indices and Values must have the same first dimension",
-                        getIndices().dims()[0], getValues().dims()[0], this);
+  isValid &= expectCompareTrue("Indices and Values must have the same shape",
+                               getIndices().dims(), getValues().dims(), this);
+  isValid &= expectCompareTrue(
+      "The size of Lengths and batches in the result should be the same",
+      getLengths().dims()[0], getResult().dims()[0], this);
+  isValid &= expectCompareTrue(
+      "The second dimension of the result should be equal to dense_last_dim",
+      getDenseLastDim(), (unsigned)getResult().dims()[1], this);
+  return isValid;
+}
+
+bool FillExamplesWithIndicatorNode::verify() const {
+  bool isValid = checkType(getResult(), getData().getElementType(), this);
+  isValid &= checkType(
+      getIndicator(),
+      {ElemKind::Int64ITy, ElemKind::Int32ITy, ElemKind::BoolTy}, this);
+  isValid &= expectCompareTrue("Indicator must be a 1D vector",
+                               getIndicator().dims().size(), size_t(1), this);
+  isValid &= expectCompareTrue("Data must have at least one dimension",
+                               getData().dims().size(), size_t(1), this,
+                               CompareOperatorGreaterEqual<size_t>());
   return isValid;
 }
 
@@ -2188,7 +2245,7 @@ bool GatherNDNode::verify() const {
   isValid &= expectCompareTrue(
       "Mismatching number of dimensions", getResult().dims().size(),
       getData().dims().size() + getIndices().dims().size() -
-          getIndices().dims()[getIndices().dims().size() - 1] - 1,
+          getIndices().dims().back() - 1 - getBatchDims(),
       this);
   isValid &= checkNotQuantizedOrSameParams(getResult().getType(),
                                            getData().getType(), this);
@@ -2388,6 +2445,63 @@ bool NonMaxSuppressionNode::verify() const {
   return isValid;
 }
 
+bool TFLiteDetectionPostProcessNode::verify() const {
+  NodeValue boxes = getBoxes();
+  NodeValue scores = getScores();
+  NodeValue anchors = getAnchors();
+
+  auto boxesDims = boxes.dims();
+  auto scoresDims = scores.dims();
+  auto anchorsDims = anchors.dims();
+
+  bool isValid = true;
+
+  // Validate input tensor sizes.
+  isValid &= expectCompareTrue("Input boxes must be a 3D tensor!",
+                               boxesDims.size(), size_t(3), this);
+  isValid &= expectCompareTrue("Input scores must be a 3D tensor!",
+                               scoresDims.size(), size_t(3), this);
+  isValid &= expectCompareTrue("Input anchors must be a 2D tensor!",
+                               anchorsDims.size(), size_t(2), this);
+  dim_t numBoxes = boxesDims[1];
+  dim_t numTotClasses = scoresDims[2];
+  isValid &= expectCompareTrue("Input boxes size invalid!", boxesDims[1],
+                               numBoxes, this);
+  isValid &= expectCompareTrue("Input boxes size invalid!", boxesDims[2],
+                               dim_t(4), this);
+  isValid &= expectCompareTrue("Input scores size invalid!", scoresDims[0],
+                               boxesDims[0], this);
+  isValid &= expectCompareTrue("Input scores size invalid!", scoresDims[1],
+                               numBoxes, this);
+  isValid &= expectCompareTrue("Input scores size invalid!", scoresDims[2],
+                               numTotClasses, this);
+  isValid &= expectCompareTrue("Input anchors size invalid!", anchorsDims[0],
+                               numBoxes, this);
+  isValid &= expectCompareTrue("Input anchors size invalid!", anchorsDims[1],
+                               dim_t(4), this);
+
+  // Validate parameters.
+  isValid &=
+      expectCompareTrue("Invalid IOU threshold!", getIouThreshold(), float(0.0),
+                        this, CompareOperatorGreaterThan<float>());
+  isValid &=
+      expectCompareTrue("Invalid IOU threshold!", getIouThreshold(), float(1.0),
+                        this, CompareOperatorLessEqual<float>());
+  isValid &=
+      expectCompareTrue("Invalid score threshold!", getScoreThreshold(),
+                        float(0.0), this, CompareOperatorGreaterThan<float>());
+  isValid &=
+      expectCompareTrue("Invalid score threshold!", getScoreThreshold(),
+                        float(1.0), this, CompareOperatorLessEqual<float>());
+  isValid &=
+      expectCompareTrue("Invalid number of classes!", dim_t(getNumClasses()),
+                        numTotClasses, this, CompareOperatorLessEqual<dim_t>());
+  isValid &=
+      expectCompareTrue("Invalid max detections!", dim_t(getMaxDetections()),
+                        dim_t(0), this, CompareOperatorGreaterThan<dim_t>());
+  return isValid;
+}
+
 bool AudioSpectrogramNode::verify() const {
   NodeValue input = getInput();
   NodeValue spectrogram = getSpectrogram();
@@ -2452,9 +2566,9 @@ bool MFCCNode::verify() const {
       "Upper frequency must be lower than half the sample rate", sampleRate,
       float(2.0 * upperFrequency), this, CompareOperatorGreaterThan<float>());
   isValid &= expectCompareTrue(
-      "Number of coefficients should be smaller than the filter bank count",
+      "Number of coefficients should be smaller or equal than the filter bank",
       dim_t(filterBankCount), dim_t(numCoefficients), this,
-      CompareOperatorGreaterThan<dim_t>());
+      CompareOperatorGreaterEqual<dim_t>());
   return isValid;
 }
 
@@ -2844,6 +2958,79 @@ bool BroadcastNode::verify() const {
 bool ModuloNode::verify() const { return getDivisor() >= 1; }
 
 bool ExternalFunctionCallNode::verify() const { return true; }
+
+static bool verifyBatchedUnaryEmbeddingsBags(NodeValue dest, NodeValue weights,
+                                             NodeValue indices,
+                                             NodeValue offsets) {
+  bool isValid = checkType(dest, weights.getElementType(), dest.getNode());
+  isValid &= checkType(
+      indices,
+      llvm::ArrayRef<ElemKind>({ElemKind::Int64ITy, ElemKind::Int32ITy}),
+      dest.getNode());
+  isValid &= checkType(
+      offsets,
+      llvm::ArrayRef<ElemKind>({ElemKind::Int64ITy, ElemKind::Int32ITy}),
+      dest.getNode());
+  isValid &=
+      expectCompareTrue("Indices must be a 1D vector", indices.dims().size(),
+                        size_t(1), dest.getNode());
+  isValid &=
+      expectCompareTrue("Offsets must be a 1D vector", offsets.dims().size(),
+                        size_t(1), dest.getNode());
+  isValid &=
+      expectCompareTrue("Weights must be a 3D vector", weights.dims().size(),
+                        size_t(3), dest.getNode());
+  return isValid;
+}
+
+bool BatchedUnaryEmbeddingsBagsNode::verify() const {
+  return verifyBatchedUnaryEmbeddingsBags(getResult(), getWeights(),
+                                          getIndices(), getOffsets());
+}
+
+static bool verifyIntNBitSplitEmbeddingBagsNode(NodeValue dest,
+                                                NodeValue devWeights,
+                                                NodeValue weightsOffsets,
+                                                NodeValue weightsPlacements,
+                                                NodeValue weightsTys) {
+  bool isValid = checkType(dest, devWeights.getElementType(), dest.getNode());
+  isValid &= checkType(devWeights, ElemKind::UInt8ITy, devWeights.getNode());
+  isValid &= checkSameShape(weightsPlacements, weightsTys,
+                            weightsPlacements.getNode());
+  isValid &= checkType(
+      weightsOffsets,
+      llvm::ArrayRef<ElemKind>({ElemKind::Int64ITy, ElemKind::Int32ITy}),
+      dest.getNode());
+  return isValid;
+}
+
+bool IntNBitSplitEmbeddingBagsNode::verify() const {
+  return verifyIntNBitSplitEmbeddingBagsNode(
+      getResult(), getDevWeights(), getWeightsOffsets(), getWeightsPlacements(),
+      getWeightsTys());
+}
+
+static bool verifyIntNBitSplitEmbeddingWeightedBagsNode(
+    NodeValue dest, NodeValue devWeights, NodeValue weightsOffsets,
+    NodeValue weightsPlacements, NodeValue weightsTys, NodeValue indices,
+    NodeValue indiceWeights) {
+  bool isValid = checkType(dest, devWeights.getElementType(), dest.getNode());
+  isValid &= checkType(devWeights, ElemKind::UInt8ITy, devWeights.getNode());
+  isValid &= checkSameShape(weightsPlacements, weightsTys,
+                            weightsPlacements.getNode());
+  isValid &= checkType(
+      weightsOffsets,
+      llvm::ArrayRef<ElemKind>({ElemKind::Int64ITy, ElemKind::Int32ITy}),
+      dest.getNode());
+  isValid &= checkSameShape(indices, indiceWeights, indiceWeights.getNode());
+  return isValid;
+}
+
+bool IntNBitSplitEmbeddingWeightedBagsNode::verify() const {
+  return verifyIntNBitSplitEmbeddingWeightedBagsNode(
+      getResult(), getDevWeights(), getWeightsOffsets(), getWeightsPlacements(),
+      getWeightsTys(), getIndices(), getIndiceWeight());
+}
 
 //===----------------------------------------------------------------------===//
 //                     Node hashing support

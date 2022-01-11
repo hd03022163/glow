@@ -17,6 +17,7 @@
 #include <fstream>
 #include <string>
 
+#include "ATen/core/interned_strings.h"
 #include "PyTorchCommon.h"
 
 #include "FuseKnownPatterns.h"
@@ -26,6 +27,7 @@
 #include "ShapeInferenceEngine.h"
 
 #include "glow/Flags/Flags.h"
+#include "glow/Runtime/ErrorReporter.h"
 #include "llvm/Support/FileSystem.h"
 
 #include "torch/csrc/jit/passes/canonicalize_graph_fuser_ops.h"
@@ -61,6 +63,7 @@ DEFINE_int32(numTracesPerDump, 1, "See PyTorchLoaderSettings");
 
 // settings for model precision conversion
 DEFINE_bool(convertToFP16, false, "See PyTorchLoaderSettings");
+DEFINE_bool(skipBiasFp32tofp16Convert, false, "See PyTorchLoaderSettings");
 DEFINE_bool(convertFusedToFP16, false, "See PyTorchLoaderSettings");
 DEFINE_bool(clipFP16, false, "See PyTorchLoaderSettings");
 DEFINE_bool(clipFP16SkipInputs, true, "See PyTorchLoaderSettings");
@@ -75,6 +78,8 @@ DEFINE_bool(onnxZipMode, false, "See PyTorchLoaderSettings");
 DEFINE_bool(writeOnnxToTmp, false, "See PyTorchLoaderSettings");
 DEFINE_int32(maxActiveRequests, 250,
              "Max number of active requests before HostManager starts queuing");
+DEFINE_bool(dumpOperatorInventory, false,
+            "Dump jit operator inventory after glow lowering.");
 DEFINE_bool(randomizeConstants, false, "See PyTorchLoaderSettings");
 DEFINE_bool(writeWithoutRandomize, false, "See PyTorchLoaderSettings");
 DEFINE_bool(runShapeInference, false, "See PyTorchLoaderSettings");
@@ -84,6 +89,7 @@ DEFINE_bool(setIncludeLastOffsets, true, "See PyTorchLoaderSettings");
 DEFINE_bool(inferShapeForCompilation, false,
             "Infer shape for the entire model for compilation");
 DEFINE_bool(enableRemoveMutation, true, "See PyTorchLoaderSettings");
+DEFINE_bool(enableDeserialize, false, "See PyTorchLoaderSettings");
 DEFINE_string(backendSpecificOpts, "",
               "Comma separated list of key=value for building the "
               "BackendSpecificOptions map in BackendOptions in "
@@ -94,9 +100,31 @@ DEFINE_int32(nominalBatchIdx, -1, "See PyTorchLoaderSettings");
 DEFINE_bool(dumpFailedInputsToOnnxFiles, false, "See PyTorchLoaderSettings");
 DEFINE_bool(lazyCompile, false, "see PyTorchLoaderSettings");
 DEFINE_bool(enableDeviceTracing, false, "See PyTorchLoaderSettings");
+DEFINE_int32(debugLayers, 5, "See PyTorchLoaderSettings");
 
 DEFINE_bool(saveGlowIRIntoONNX, false, "See PyTorchLoaderSettings");
 DEFINE_bool(loadGlowIRFromONNX, false, "See PyTorchLoaderSettings");
+
+DEFINE_bool(useSparseNNPartitioningScheme, false, "See PyTorchLoaderSettings");
+DEFINE_bool(sparseNNPartitioningAddSLSConcats, false,
+            "See PyTorchLoaderSettings");
+DEFINE_bool(sparseNNPartitioningBalancePerfModel, false,
+            "See PyTorchLoaderSettings");
+DEFINE_bool(sparseNNPartitioningPairLNWithSLS, false,
+            "See PyTorchLoaderSettings");
+DEFINE_bool(sparseNNPartitioningPairTileWithSLS, false,
+            "See PyTorchLoaderSettings");
+DEFINE_string(sparseNNPartitioningPairSLSWith, "", "See PyTorchLoaderSettings");
+DEFINE_int32(sparseNNPartitioningConcatSplitSize, 1,
+             "See PyTorchLoaderSettings");
+DEFINE_int32(sparseNNPartitioningSchemeNumCards, 1,
+             "See PyTorchLoaderSettings");
+DEFINE_int64(sparseNNPartitioningSchemeSLSTableKBytesPerCard, 1,
+             "See PyTorchLoaderSettings");
+DEFINE_int32(SparseNNPartitioningSchemeNumCoresSLS, 1,
+             "See PyTorchLoaderSettings");
+DEFINE_int32(SparseNNPartitioningSchemeNumCoresOther, 1,
+             "See PyTorchLoaderSettings");
 
 namespace glow {
 namespace {
@@ -116,6 +144,20 @@ PyTorchLoaderSettings &getPyTorchLoaderSettingsInternalOnly() {
 }
 
 } // namespace
+
+void dumpOperatorStats(const torch::jit::Graph &graph) {
+  std::map<torch::jit::NodeKind, int> opCounter;
+  for (const auto *node : graph.nodes()) {
+    opCounter[node->kind()]++;
+  }
+  std::ostringstream ss;
+  ss << "Dump of operator/node stats for graph:\n";
+  ss << folly::stringPrintf("%45s %13s \n", "Node Kind", "Count");
+  for (const auto &[kind, count] : opCounter) {
+    ss << folly::stringPrintf("%45s %13d \n", kind.toQualString(), count);
+  }
+  LOG(INFO) << ss.str();
+}
 
 std::shared_ptr<runtime::HostManager>
 getHostManager(const PyTorchLoaderSettings &settings) {
@@ -213,6 +255,7 @@ c10::ScalarType elemKindToScalarType(glow::ElemKind ty) {
     LOG(DFATAL) << "UInt8QTy is not supported yet.";
     return at::kQUInt8;
   case ElemKind::Float64Ty:
+    return at::kDouble;
   case ElemKind::UInt8FusedQTy:
   case ElemKind::UInt8FusedFP16QTy:
   case ElemKind::UInt4FusedFP16QTy:
@@ -220,6 +263,7 @@ c10::ScalarType elemKindToScalarType(glow::ElemKind ty) {
   case ElemKind::UInt8ITy:
   case ElemKind::Int16QTy:
   case ElemKind::Int32QTy:
+  case ElemKind::Int64QTy:
     LOG(DFATAL) << "Not supported yet.";
     return at::kLong;
   }
@@ -246,9 +290,11 @@ glow::ElemKind scalarTypeToElemKind(c10::ScalarType ty) {
     return ElemKind::Int8QTy;
   } else if (ty == at::kQUInt8) {
     return ElemKind::UInt8QTy;
+  } else if (ty == at::kDouble) {
+    return ElemKind::Float64Ty;
   } else {
-    LOG(DFATAL) << "ScalarType " << static_cast<int>(ty)
-                << " not supported yet.";
+    LOG(DFATAL) << "ScalarType " << c10::toString(ty)
+                << " is not supported yet. Using int64 instead";
     return ElemKind::Int64ITy;
   }
 }
@@ -304,6 +350,7 @@ void PyTorchLoaderSettings::initSettings() {
   numTracesPerDump = FLAGS_numTracesPerDump;
   saturateHost = FLAGS_saturateHost;
   convertToFP16 = FLAGS_convertToFP16;
+  skipBiasFp32tofp16Convert = FLAGS_skipBiasFp32tofp16Convert;
   convertFusedToFP16 = FLAGS_convertFusedToFP16;
   clipFP16 = FLAGS_clipFP16;
   clipFP16SkipInputs = FLAGS_clipFP16SkipInputs;
@@ -317,6 +364,7 @@ void PyTorchLoaderSettings::initSettings() {
   enableDeviceTracing = FLAGS_enableDeviceTracing;
   writeOnnxToTmp = FLAGS_writeOnnxToTmp;
   randomizeConstants = FLAGS_randomizeConstants;
+  dumpOperatorInventory = FLAGS_dumpOperatorInventory;
   writeWithoutRandomize = FLAGS_writeWithoutRandomize;
   backendName = FLAGS_torch_glow_backend;
   numDevices = FLAGS_torch_glow_num_devices;
@@ -325,6 +373,7 @@ void PyTorchLoaderSettings::initSettings() {
   fusionStartIndex = FLAGS_fusionStartIndex;
   fusionEndIndex = FLAGS_fusionEndIndex;
   setIncludeLastOffsets = FLAGS_setIncludeLastOffsets;
+  enableDeserialize = FLAGS_enableDeserialize;
   enableRemoveMutation = FLAGS_enableRemoveMutation;
   debugContinuouslyVerifyDuringModelLoading =
       FLAGS_debugContinuouslyVerifyDuringModelLoading;
@@ -337,11 +386,30 @@ void PyTorchLoaderSettings::initSettings() {
   saveGlowIRIntoONNX = FLAGS_saveGlowIRIntoONNX;
   loadGlowIRFromONNX = FLAGS_loadGlowIRFromONNX;
   skipProvisioning = glow::flags::SkipProvisioning || saveGlowIRIntoONNX;
+  sinkTanhBelowConcat = glow::flags::SinkTanhBelowConcat;
+  useSparseNNPartitioningScheme = FLAGS_useSparseNNPartitioningScheme;
+  sparseNNPartitioningAddSLSConcats = FLAGS_sparseNNPartitioningAddSLSConcats;
+  sparseNNPartitioningBalancePerfModel =
+      FLAGS_sparseNNPartitioningBalancePerfModel;
+  sparseNNPartitioningPairLNWithSLS = FLAGS_sparseNNPartitioningPairLNWithSLS;
+  sparseNNPartitioningPairTileWithSLS =
+      FLAGS_sparseNNPartitioningPairTileWithSLS;
+  sparseNNPartitioningPairSLSWith = FLAGS_sparseNNPartitioningPairSLSWith;
+  sparseNNPartitioningConcatSplitSize =
+      FLAGS_sparseNNPartitioningConcatSplitSize;
+  sparseNNPartitioningSchemeNumCards = FLAGS_sparseNNPartitioningSchemeNumCards;
+  sparseNNPartitioningSchemeSLSTableKBytesPerCard =
+      FLAGS_sparseNNPartitioningSchemeSLSTableKBytesPerCard;
+  SparseNNPartitioningSchemeNumCoresSLS =
+      FLAGS_SparseNNPartitioningSchemeNumCoresSLS;
+  SparseNNPartitioningSchemeNumCoresOther =
+      FLAGS_SparseNNPartitioningSchemeNumCoresOther;
+  debugLayers = FLAGS_debugLayers;
 
   if (!FLAGS_opBlacklist.empty()) {
     auto kindStrings = splitString(FLAGS_opBlacklist);
     for (const auto &kindString : kindStrings) {
-      opBlacklist.insert(torch::jit::Symbol::fromQualString(kindString));
+      opBlocklist.insert(torch::jit::Symbol::fromQualString(kindString));
     }
   }
 
@@ -368,6 +436,7 @@ std::string PyTorchLoaderSettings::toString() const {
   std::stringstream s;
   s << std::endl;
   INSERT_BOOL_TO_STREAM(convertToFP16, s);
+  INSERT_BOOL_TO_STREAM(skipBiasFp32tofp16Convert, s);
   INSERT_BOOL_TO_STREAM(convertFusedToFP16, s);
   INSERT_BOOL_TO_STREAM(clipFP16, s);
   INSERT_BOOL_TO_STREAM(clipFP16SkipInputs, s);
@@ -384,6 +453,7 @@ std::string PyTorchLoaderSettings::toString() const {
   INSERT_VALUE_TO_STREAM(maxFusionMergeSize, s);
   INSERT_VALUE_TO_STREAM(fusionStartIndex, s);
   INSERT_BOOL_TO_STREAM(enableRemoveMutation, s);
+  INSERT_BOOL_TO_STREAM(enableDeserialize, s);
   INSERT_VALUE_TO_STREAM(fusionEndIndex, s);
   INSERT_BOOL_TO_STREAM(dumpFinalGlowGraph, s);
   INSERT_BOOL_TO_STREAM(enableGlowTracing, s);
@@ -404,10 +474,12 @@ std::string PyTorchLoaderSettings::toString() const {
   INSERT_BOOL_TO_STREAM(dumpFailedInputsToOnnxFiles, s);
   INSERT_BOOL_TO_STREAM(lazyCompile, s);
   INSERT_BOOL_TO_STREAM(enableDeviceTracing, s);
+  INSERT_VALUE_TO_STREAM(debugLayers, s);
+  INSERT_BOOL_TO_STREAM(useMaxSizeCompilation, s);
 
-  if (opBlacklist.size() > 0) {
-    s << "opBlacklist: [";
-    for (const auto &op : opBlacklist) {
+  if (opBlocklist.size() > 0) {
+    s << "opBlocklist: [";
+    for (const auto &op : opBlocklist) {
       s << op.toQualString() << ",";
     }
     s << "]" << std::endl;
@@ -579,8 +651,9 @@ glow::Tensor ptTensorToGlowTensor(const at::Tensor &ptTensor) {
 // Preprocess jit module to prepare for lowering. Here we leverage JIT freeze
 // API to cleanup the IR after IR rewrites.
 void modelPreprocessing(torch::jit::Module &model,
-                        const std::string method_name) {
-  auto graph = model.get_method(method_name).function().graph();
+                        const std::string &method_name) {
+  auto graph =
+      toGraphFunction(model.get_method(method_name).function()).graph();
 
   torch::jit::CanonicalizeOps(graph);
   detail::rewriteQuantizedLinear(graph);
@@ -595,9 +668,16 @@ void modelPreprocessing(torch::jit::Module &model,
 void glowAOTFusionWithShapeInference(
     torch::jit::Module &model, const InputMetaStack &metaStack,
     runtime::DeferredWeightLoader *loader,
-    const PyTorchLoaderSettings &settings, const std::string method_name,
-    const std::unordered_map<int, std::string> &batchShapes) {
-  auto graph = model.get_method(method_name).function().graph();
+    const PyTorchLoaderSettings &settings, std::string method_name,
+    const std::unordered_map<int, std::string> &batchShapes,
+    std::shared_ptr<std::string> glowAOTSerializationSpecStrPtr,
+    std::shared_ptr<std::string> glowAOTSerializationModelStrPtr,
+    const std::string &serializationSpec, const std::string &onnxModelFile,
+    c10::optional<PostFusionProcessFn> postFusionProcessFn,
+    const c10::optional<ModelCompilationConfigOverride>
+        &modelCompilationConfigOverride) {
+  auto graph =
+      toGraphFunction(model.get_method(method_name).function()).graph();
 
   // create some fake inputs to run shape inference.
   // Usually users provide one set of inputs for the entire
@@ -621,6 +701,12 @@ void glowAOTFusionWithShapeInference(
 
   // There could be multiple glow fusion nodes created.
   glow::glowCustomFuse(graph, settings);
+
+  // If anything needs to be adjusted after graph fusion,
+  // then this callback can do it.
+  if (postFusionProcessFn) {
+    (*postFusionProcessFn)(graph);
+  }
 
   ShapeInferenceEngine shapeInf(*graph, inputRefs, baseSymbol, true);
   auto e = shapeInf.run();
@@ -680,14 +766,12 @@ void glowAOTFusionWithShapeInference(
             itr->second.dtype, itr->second.shape<TensorShape>());
       }
 
-      e = runner->warmCache({metaStackForCompilation}, settings, loader,
-                            /*useMaxSizeCompilation*/ true);
-      if (e) {
-        // If the graph is already compiled previously, warmCache() will report
-        // an error but it is fine with our execution. So here we extract the
-        // error only.
-        LOG(ERROR) << ERR_TO_STRING(std::move(e));
-      }
+      REPORT_AND_EXIT_ON_ERR(runner->warmCache(
+          {metaStackForCompilation}, settings, loader,
+          /*useMaxSizeCompilation*/ true, /*useDeserialize*/ false,
+          /*nameToFunctions*/ nullptr, glowAOTSerializationSpecStrPtr,
+          glowAOTSerializationModelStrPtr, serializationSpec, onnxModelFile,
+          modelCompilationConfigOverride));
 
       if (batchShapesMap.size() > 0) {
         auto graphOutputValues = subgraph->outputs();
@@ -716,24 +800,43 @@ void glowAOTFusionWithShapeInference(
 void glowAOTFusion(torch::jit::Module &model, const std::string &inputMetaStr,
                    runtime::DeferredWeightLoader *loader,
                    const PyTorchLoaderSettings &settings,
-                   const std::string method_name,
-                   const std::unordered_map<int, std::string> &batchShapes) {
+                   std::string method_name,
+                   const std::unordered_map<int, std::string> &batchShapes,
+                   std::shared_ptr<std::string> glowAOTSerializationSpecStrPtr,
+                   std::shared_ptr<std::string> glowAOTSerializationModelStrPtr,
+                   const std::string &serializationSpec,
+                   const std::string &onnxModelFile,
+                   c10::optional<PostFusionProcessFn> postFusionProcessFn,
+                   const c10::optional<ModelCompilationConfigOverride>
+                       &modelCompilationConfigOverride) {
   InputMetaStack metaStack = glow::loadInputMeta(inputMetaStr);
 
   modelPreprocessing(model, method_name);
 
-  if (FLAGS_inferShapeForCompilation) {
-    return glowAOTFusionWithShapeInference(model, metaStack, loader, settings,
-                                           method_name, batchShapes);
+  // In Glow AOT serialization (i.e., settings.saveGlowIRIntoONNX = true), we
+  // always enable inferShapeForCompilation
+  if (FLAGS_inferShapeForCompilation || settings.saveGlowIRIntoONNX) {
+    return glowAOTFusionWithShapeInference(
+        model, metaStack, loader, settings, method_name, batchShapes,
+        glowAOTSerializationSpecStrPtr, glowAOTSerializationModelStrPtr,
+        serializationSpec, onnxModelFile, postFusionProcessFn,
+        modelCompilationConfigOverride);
   }
 
   // We assume the model is flattened and only one graph will be lowered. In the
   // future we may need to support multiple graphs.
-  auto graph = model.get_method(method_name).function().graph();
+  auto graph =
+      toGraphFunction(model.get_method(method_name).function()).graph();
 
   c10::Symbol symbol = glow::getGlowSymbol(graph);
   glow::registerGlowOp(symbol);
   glow::glowCustomFuse(graph, settings, symbol);
+
+  // If anything needs to be adjusted after graph fusion,
+  // then this callback can do it.
+  if (postFusionProcessFn) {
+    (*postFusionProcessFn)(graph);
+  }
 
   // this is the fuser subgraph to lower
   std::shared_ptr<torch::jit::Graph> subgraph;
@@ -756,8 +859,12 @@ void glowAOTFusion(torch::jit::Module &model, const std::string &inputMetaStr,
             subgraph, getHostManager(settings), settings, /*useRunOnly*/ true);
       });
 
-  auto e = runner->warmCache({metaStack}, settings, loader,
-                             /*useMaxSizeCompilation*/ true);
+  auto e = runner->warmCache(
+      {metaStack}, settings, loader,
+      /*useMaxSizeCompilation*/ true, /*useDeserialize*/ false,
+      /*nameToFunctions*/ nullptr, glowAOTSerializationSpecStrPtr,
+      glowAOTSerializationModelStrPtr, serializationSpec, onnxModelFile,
+      modelCompilationConfigOverride);
   if (e) {
     // If the graph is already compiled previously, warmCache() will report
     // an error but it is fine with our execution. So here we extract the
@@ -805,6 +912,9 @@ BatchShapesMapType parseBatchShapeMapFromInputMeta(
     const at::ArrayRef<torch::jit::IValue> inputRefs(inputs);
     ShapeInferenceEngine shapeInf(*graph, inputRefs, baseSymbol, true);
     auto e = shapeInf.run();
+    if (e) {
+      LOG(ERROR) << ERR_TO_STRING(std::move(e));
+    }
     const auto &shapeMap = shapeInf.getVariableMap();
     batchShapesMap[it.first] = shapeMap;
   }

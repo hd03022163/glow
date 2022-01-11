@@ -53,6 +53,49 @@ loadOperatorName<caffe2::OperatorDef>(const caffe2::OperatorDef &op) {
   }
   return op.type();
 }
+
+// FIXME: this is a temporary solution for the case when NonZero returns
+// -2^31 as the boundary for the returned indices. For examples, currently
+// we get this NonZero([0, 1, 1, 0, 0]) -> [1, 2, -2^31, 0, 0], because the
+// shapes are static. This function makes sure that the output looks like
+// [1, 2, -1, -1, -1] which is more convenient for now.
+// The logic is we get [1, 2, -2^31, 0, 0], then we convert to [0, 0, 1, 0, 0]
+// by finding negative element, then do cumsum so we get [0, 0, 1, 1, 1],
+// then whenever we see 0, we use original value and when we see 1 we use -1,
+// so it becomes [1, 2, -1, -1, -1].
+Node *fixNonZero(Function *F, Module &mod, const std::string opName,
+                 NodeValue node) {
+  auto zeroes = F->createSplat(opName + ".fixNZ.zeroes", node.getType(), 0);
+  auto floatTy = mod.uniqueType(ElemKind::Float16Ty, node.dims());
+  auto minusOnesFloat =
+      F->createSplat(opName + ".fixNZ.minusOnesFloat", floatTy, -1);
+  auto zeroesFloat = F->createSplat(opName + ".fixNZ.zeroesFloat", floatTy, 0);
+  auto onesFloat = F->createSplat(opName + ".fixNZ.onesFloat", floatTy, 1);
+  auto nodeFloat = F->createConvertTo(opName + ".fixNZ.float", node, floatTy);
+
+  // If there is a boundary, it will be marked as true.
+  auto isNegBool = F->createCmpLT(opName + ".fixNZ.isNegBool", node, zeroes);
+  auto isNegFloat = F->createSelect(opName + ".fixNZ.isNegFloat", isNegBool,
+                                    onesFloat, zeroesFloat);
+  auto isNegInt = F->createConvertTo(opName + ".fixNZ.isNegInt", isNegFloat,
+                                     node.getType());
+
+  // After applying cumsum every element before boundary will be 0
+  // and starting from boundary will be 1.
+  auto cumSum = F->createCumSum(opName + ".fixNZ.cumSum", isNegInt, 0);
+
+  auto isAfterBoundary =
+      F->createCmpGT(opName + ".fixNZ.isAfterBoundary", cumSum, zeroes);
+
+  auto withMinusOnesFloat =
+      F->createSelect(opName + ".fixNZ.withMinusOnesFloat", isAfterBoundary,
+                      minusOnesFloat, nodeFloat);
+
+  auto withMinusOnesInt = F->createConvertTo(
+      opName + ".fixNZ.withMinusOnesInt", withMinusOnesFloat, node.getType());
+
+  return withMinusOnesInt;
+}
 }; // namespace glow
 
 /// Legacy padding modes supported in caffe2.  These are used by MaxPool
@@ -267,7 +310,11 @@ Caffe2ModelLoader::loadProtoFile(const std::string &filename) {
     google::protobuf::io::IstreamInputStream filestr(&ff);
     google::protobuf::io::CodedInputStream codedstr(&filestr);
     // Don't warn about large file sizes.
+#if GOOGLE_PROTOBUF_VERSION >= 3002000
+    codedstr.SetTotalBytesLimit(MAX_PROTO_SIZE);
+#else
     codedstr.SetTotalBytesLimit(MAX_PROTO_SIZE, MAX_PROTO_SIZE);
+#endif
     parseNet = net.ParseFromCodedStream(&codedstr);
   }
 
@@ -282,7 +329,11 @@ Expected<caffe2::NetDef> Caffe2ModelLoader::loadProto(const void *c2Model,
   google::protobuf::io::CodedInputStream codedStream(&arrayStream);
 
   // Don't warn about large file sizes.
+#if GOOGLE_PROTOBUF_VERSION >= 3002000
+  codedStream.SetTotalBytesLimit(MAX_PROTO_SIZE);
+#else
   codedStream.SetTotalBytesLimit(MAX_PROTO_SIZE, MAX_PROTO_SIZE);
+#endif
   caffe2::NetDef MP;
   bool parseNet = MP.ParseFromCodedStream(&codedStream);
   RETURN_ERR_IF_NOT(parseNet, "Failed to parse NetDef");
@@ -772,6 +823,15 @@ Error Caffe2ModelLoader::loadOperator(const caffe2::OperatorDef &op) {
   }
   const std::string &opName = loadOperatorName(op);
 
+  if (typeName == "Gelu") {
+    NodeValue in;
+    ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
+    Node *node = G_->createGelu(opName, in);
+
+    RETURN_IF_ERR(addNodeAsOutput(op, node));
+    return Error::success();
+  }
+
   if (typeName == "Conv" || typeName == "ConvRelu") {
     return loadConv(op, dict);
   }
@@ -1186,7 +1246,16 @@ Error Caffe2ModelLoader::loadOperator(const caffe2::OperatorDef &op) {
       ASSIGN_VALUE_OR_RETURN_ERR(
           outTy, loadQuantTy(opName, ElemKind::Int8QTy,
                              {outputDims.first, B.dims()[0]}, dict));
-      node = G_->createFullyConnected(opName, in, W, B, outTy, axis);
+      int dequantizeOutput = 0;
+      if (dict.count("dequantize_output")) {
+        ASSIGN_VALUE_OR_RETURN_ERR(dequantizeOutput,
+                                   loadInt(dict["dequantize_output"]));
+      }
+      if (dequantizeOutput == 1) {
+        node = G_->createDynamicQuantizedFullyConnected(opName, in, W, B);
+      } else {
+        node = G_->createFullyConnected(opName, in, W, B, outTy, axis);
+      }
     } else if (typeName == "FbFCPacked") {
       RETURN_ERR_IF_NOT(W.getElementType() == ElemKind::Float16Ty,
                         opErrMsg(op, "Expected float16 weights."));
@@ -1488,7 +1557,8 @@ Error Caffe2ModelLoader::loadOperator(const caffe2::OperatorDef &op) {
   }
 
   if (typeName == "ConstantFill" || typeName == "GivenTensorIntFill" ||
-      typeName == "GivenTensorInt64Fill" || typeName == "GaussianFill") {
+      typeName == "GivenTensorInt64Fill" || typeName == "GaussianFill" ||
+      typeName == "UniformFill") {
     RETURN_IF_ERR(loadWeight(op));
     return Error::success();
   }
@@ -1958,20 +2028,27 @@ Error Caffe2ModelLoader::loadOperator(const caffe2::OperatorDef &op) {
     // must go from int -> float -> bool. Due to fp16 clipping, since only
     // int32 -> fp16 conversions are available, there is an initial conversion
     // from int64 to int32 if necessary.
-    auto indicatorIntToFloat = G_->createConvertTo(
-        opName + ".intToFloat", indicator, ElemKind::FloatTy);
-    auto indicatorFloatToBool = G_->createConvertTo(
-        opName + ".floatToBool", indicatorIntToFloat, ElemKind::BoolTy);
-    auto nonZeroIndices =
-        G_->createNonZero(opName + ".nonzero", indicatorFloatToBool);
+    auto indicatorFloat = G_->createConvertTo(opName + ".intToFloat", indicator,
+                                              ElemKind::FloatTy);
+    auto indicatorBool = G_->createConvertTo(opName + ".floatToBool",
+                                             indicatorFloat, ElemKind::BoolTy);
+    auto nzIndices = G_->createNonZero(opName + ".nonzero", indicatorBool);
+
+    auto nzIndicesFixed = fixNonZero(G_, mod_, opName, nzIndices);
     auto nonZeroCount = data.dims()[0];
-    auto indices = G_->createSlice(opName + ".indices", nonZeroIndices, {0, 0},
-                                   {nonZeroCount, 1});
+    RETURN_ERR_IF_NOT(nonZeroCount <= nzIndicesFixed->getNthResult(0).dims()[0],
+                      opErrMsg(op,
+                               "The number of "
+                               "non-zero elements in the indicator must be at "
+                               "least that of the first dimension of data"));
+
+    auto indices = G_->createSlice(opName + ".indices", nzIndicesFixed, {0, 0},
+                                   {data.dims()[0], 1});
 
     auto zeros = G_->createSplat(opName + ".zeros", outTy2D, 0);
 
     auto res2D = G_->createScatterData(opName + ".scatterData", zeros, indices,
-                                       data2D, false);
+                                       data2D, true);
     auto node = G_->createReshape(opName + ".result", res2D, outDims);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
     return Error::success();
@@ -2033,9 +2110,10 @@ Error Caffe2ModelLoader::loadOperator(const caffe2::OperatorDef &op) {
         opName + ".floatToBool", lengthsIntToFloat, ElemKind::BoolTy);
     auto nonZeroIndices =
         G_->createNonZero(opName + ".nonzero", lengthsFloatToBool);
+    auto nonZeroIndicesFixed = fixNonZero(G_, mod_, opName, nonZeroIndices);
     auto numIndices = indices.dims()[0];
     auto indicesSliced = G_->createSlice(
-        opName + ".indicesSlice", nonZeroIndices, {0, 0}, {numIndices, 1});
+        opName + ".indicesSlice", nonZeroIndicesFixed, {0, 0}, {numIndices, 1});
 
     ShapeVector outDims{lengths.dims()[0], 1};
     auto dataTy = mod_.uniqueTypeWithNewShape(values.getType(), outDims);
@@ -2043,7 +2121,7 @@ Error Caffe2ModelLoader::loadOperator(const caffe2::OperatorDef &op) {
     auto values2D =
         G_->createReshape(opName + ".reshape", values, {numIndices, 1});
     auto scatterData = G_->createScatterData(opName + ".scatterData", data,
-                                             indicesSliced, values2D, false);
+                                             indicesSliced, values2D, true);
 
     RETURN_IF_ERR(addNodeAsOutput(op, scatterData));
     return Error::success();
@@ -2704,7 +2782,36 @@ Error Caffe2ModelLoader::loadWeight(const caffe2::OperatorDef &op) {
     const auto &name = op.output(0);
     Tensor T;
     std::vector<dim_t> dim;
-    ASSIGN_VALUE_OR_RETURN_ERR(dim, getShape<dim_t>(dict["shape"]));
+    if (dict.count("shape")) {
+      ASSIGN_VALUE_OR_RETURN_ERR(dim, getShape<dim_t>(dict["shape"]));
+    } else {
+      RETURN_ERR_IF_NOT(op.input_size() > 0,
+                        "If no shape provided, must have input shape.");
+
+      bool inputAsShape = false;
+      if (dict.count("input_as_shape")) {
+        ASSIGN_VALUE_OR_RETURN_ERR(inputAsShape,
+                                   loadInt(dict["input_as_shape"]));
+      }
+
+      if (inputAsShape) {
+        Constant *in;
+        ASSIGN_VALUE_OR_RETURN_ERR(in, getConstantByName(op.input(0)));
+        RETURN_ERR_IF_NOT(in->dims().size() == 1,
+                          opErrMsg(op, "Input must be 1D tensor."));
+        RETURN_ERR_IF_NOT(in->getElementType() == ElemKind::Int64ITy,
+                          opErrMsg(op, "Input must be of int64 type."));
+        const auto handle = in->getHandle<int64_t>();
+        dim.reserve(in->dims().size());
+        for (auto d : handle) {
+          dim.push_back(d);
+        }
+      } else {
+        NodeValue input;
+        ASSIGN_VALUE_OR_RETURN_ERR(input, getNodeValueByName(op.input(0)));
+        dim = input.dims();
+      }
+    }
     T.reset(ElemKind::FloatTy, dim);
     auto TH = T.getHandle<>();
     float tensorMin;

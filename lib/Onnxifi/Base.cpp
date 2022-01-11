@@ -299,18 +299,26 @@ onnxStatus Graph::adjustInputs(uint32_t inputsCount,
     const unsigned elementSize =
         getOnnxTensorDescriptorElementSize(inOnnxTensor.dataType);
     const unsigned glowElementSize = inPhPtr->getType()->getElementSize();
+    bool needsUpcast = false;
     if (elementSize != glowElementSize) {
-      LOG(ERROR) << "Input data width (" << elementSize
-                 << ") is different from glow placeholder data width ("
-                 << glowElementSize << "), tensor: " << inOnnxTensor.name
-                 << ", onnxifi data type: " << inOnnxTensor.dataType
-                 << ", glow data type: "
-                 << inPhPtr->getType()->getElementName().data();
-      return ONNXIFI_STATUS_INVALID_DATATYPE;
+      // If an input tensor is of int32 type and the placeholder expects int64,
+      // we can allow upcasting the same way as Caffe2 allows.
+      if (inOnnxTensor.dataType == ONNXIFI_DATATYPE_INT32 &&
+          inPhPtr->getType()->getElementType() == ElemKind::Int64ITy) {
+        needsUpcast = true;
+      } else {
+        LOG(ERROR) << "Input data width (" << elementSize
+                   << ") is different from glow placeholder data width ("
+                   << glowElementSize << "), tensor: " << inOnnxTensor.name
+                   << ", onnxifi data type: " << inOnnxTensor.dataType
+                   << ", glow data type: "
+                   << inPhPtr->getType()->getElementName().data();
+        return ONNXIFI_STATUS_INVALID_DATATYPE;
+      }
     }
     bool processed = true;
     size_t onnxBytes = inOnnxTensorSize * elementSize;
-    if (!quantizedInput) {
+    if (!quantizedInput && !needsUpcast) {
       if (inPhPtr->dims().equals(inOnnxTensorDims)) {
         externalIOBindings.emplace_back(
             std::piecewise_construct, std::forward_as_tuple(inPhPtr),
@@ -373,6 +381,28 @@ onnxStatus Graph::adjustInputs(uint32_t inputsCount,
         supported = false;
       }
       if (!supported) {
+        return ONNXIFI_STATUS_INVALID_DATATYPE;
+      }
+    }
+
+    if (needsUpcast) {
+      if (!inOnnxBuffer) {
+        LOG(ERROR) << "Can't upcast tensor " << inOnnxTensor.name
+                   << " because buffer is not present";
+        return ONNXIFI_STATUS_INTERNAL_ERROR;
+      }
+      if (inOnnxTensor.dataType == ONNXIFI_DATATYPE_INT32 &&
+          inPhPtr->getType()->getElementType() == ElemKind::Int64ITy) {
+        auto TH = inputTensor.getHandle<int64_t>();
+        auto data = reinterpret_cast<int32_t *>(inOnnxBuffer);
+        for (size_t k = 0; k < inOnnxTensorSize; ++k) {
+          TH.raw(k) = (int64_t)data[k];
+        }
+      } else {
+        LOG(ERROR) << "Unsupported upcast for tensor " << inOnnxTensor.name
+                   << ", onnxifi data type: " << inOnnxTensor.dataType
+                   << ", glow data type: "
+                   << inPhPtr->getType()->getElementName().data();
         return ONNXIFI_STATUS_INVALID_DATATYPE;
       }
     }
@@ -447,7 +477,7 @@ onnxStatus Graph::setIOAndRun(uint32_t inputsCount,
                   << " partial size=" << inputTensor.getUnpaddedSizeInBytes()
                   << " resized size=" << resized.getType().toString();
         }
-        t->set_name(p.first->getName());
+        t->set_name(p.first->getName().str());
       }
       std::string buffer;
       inputG.SerializeToString(&buffer);
@@ -543,7 +573,7 @@ onnxStatus Graph::setIOAndRun(uint32_t inputsCount,
         auto *t = inputG.add_initializer();
         ONNXModelWriter::writeTensor(outputTensor, t,
                                      glow::flags::UseCustomOpsForExport);
-        t->set_name(outPhPtr->getName());
+        t->set_name(outPhPtr->getName().str());
       }
       std::string buffer;
       inputG.SerializeToString(&buffer);

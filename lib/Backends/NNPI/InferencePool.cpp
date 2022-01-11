@@ -114,6 +114,23 @@ Error InferencePoolEnv::init(NNPIAdapterContainer *adapter,
           strFormat("Failed to load NNPI IA Extension object for function %s",
                     functionName.c_str()));
     }
+
+#if NNPI_INF_MAJOR_VERSION >= 1 || NNPI_INF_MINOR_VERSION >= 11
+    for (auto &extensionLib : nnpiCompiledFunction_->getIAExtensionLibs()) {
+      NNPIExtension ext;
+      LOG_NNPI_INF_IF_ERROR_RETURN_LLVMERROR(
+          nnpiExtensionCreateLoadBin(extensionLib.first.c_str(),
+                                     extensionLib.second.data(),
+                                     extensionLib.second.size(), &ext),
+          strFormat("Failed to create NNPI IA Extension object for function %s",
+                    functionName.c_str()));
+      LOG_NNPI_INF_IF_ERROR_RETURN_LLVMERROR(
+          nnpiDeviceContextLoadExtension(device, ext),
+          strFormat("Failed to load NNPI IA Extension object for function %s",
+                    functionName.c_str()));
+    }
+#endif // NNPI INF >= 0.11
+
     // Create NNPI host network (load compiled binary).
     auto filename = nnpiCompiledFunction_->getCompilationFilename();
     if (filename.empty()) // Create network from memory.
@@ -262,7 +279,6 @@ Error InferencePoolEnv::init(NNPIAdapterContainer *adapter,
         nnpiCompiledFunction_->getCompiledNetworkHandle(),
         nnpiCompiledFunction_->getCompilationConfig(), deviceNetwork_, adapter,
         device, nnpiCompiledFunction_->getPartialInputs(),
-        nnpiCompiledFunction_->getValidateSLSInputs(),
         nnpiCompiledFunction_->getPaddedInputs(),
         nnpiCompiledFunction_->getStaticInputs(), staticPlaceholderMap_,
         deviceOptions_, functionName_, deviceId_);
@@ -350,7 +366,6 @@ InferencePoolEnv::createDetachedInferenceContext(PlaceholderUsageMap &phUsage) {
           nnpiCompiledFunction_->getCompiledNetworkHandle(),
           nnpiCompiledFunction_->getCompilationConfig(), deviceNetwork_,
           pAdapter_, device_, nnpiCompiledFunction_->getPartialInputs(),
-          nnpiCompiledFunction_->getValidateSLSInputs(),
           nnpiCompiledFunction_->getPaddedInputs(),
           nnpiCompiledFunction_->getStaticInputs(), staticPlaceholderMap_,
           deviceOptions_, functionName_, deviceId_, &phUsage)) {

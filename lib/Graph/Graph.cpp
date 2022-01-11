@@ -29,6 +29,7 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
 #ifdef WIN32
@@ -1285,6 +1286,26 @@ SwishNode *Function::createSwish(llvm::StringRef name, NodeValue input,
   return createSwish(name, OT, input);
 }
 
+ClipNode *Function::createHardSigmoid(llvm::StringRef name, TypeRef outTy,
+                                      NodeValue input, float alpha,
+                                      float beta) {
+  auto ty = input.getType();
+
+  // max(0, min(1, alpha * x + beta))
+  auto *alphaSplat = createSplat(name.str() + ".alpha", ty, alpha);
+  auto *betaSplat = createSplat(name.str() + ".beta", ty, beta);
+
+  auto *mul = createMul(name.str() + ".mul", alphaSplat, input);
+  auto *add = createAdd(name.str() + ".add", mul, betaSplat);
+
+  return createClip(name.str() + ".clip", add, outTy, 0, 1);
+}
+
+ClipNode *Function::createHardSigmoid(llvm::StringRef name, NodeValue input,
+                                      float alpha, float beta) {
+  return createHardSigmoid(name, input.getType(), input, alpha, beta);
+}
+
 TanhNode *Function::createTanh(llvm::StringRef name, TypeRef outTy,
                                NodeValue input) {
   return addNode(new TanhNode(name, outTy, input));
@@ -1307,7 +1328,7 @@ SoftMaxNode *Function::createSoftMax(llvm::StringRef name, NodeValue input,
                                      float beta) {
   // Create input multiplier with beta.
   if (beta != 1.0) {
-    auto *splat = createSplat(name, input.getType(), 1);
+    auto *splat = createSplat(name, input.getType(), beta);
     input = createMul(name, input, splat);
   }
   // By default, pick the input type.
@@ -1322,7 +1343,7 @@ LogSoftMaxNode *Function::createLogSoftMax(llvm::StringRef name,
                                            TypeRef outTy, float beta) {
   // Create input multiplier with beta.
   if (beta != 1.0) {
-    auto *splat = createSplat(name, input.getType(), 1);
+    auto *splat = createSplat(name, input.getType(), beta);
     input = createMul(name, input, splat);
   }
   // By default, pick the input type.
@@ -1557,6 +1578,22 @@ TileNode *Function::createTile(llvm::StringRef name, NodeValue input,
   return addNode(new TileNode(name, outTy, input, tiles, axis));
 }
 
+TileNode *Function::createTile(llvm::StringRef name, NodeValue input,
+                               llvm::ArrayRef<unsigned_t> tiles,
+                               llvm::ArrayRef<unsigned_t> axes) {
+  assert(tiles.size() && "The array of tiles is empty!");
+  assert(axes.size() && "The array of axes is empty!");
+  assert(tiles.size() == axes.size() &&
+         "The array for tiles and axes must be equal!");
+  TileNode *tileNode = nullptr;
+  for (size_t idx = 0; idx < tiles.size(); ++idx) {
+    tileNode = createTile(name.str() + "." + std::to_string(idx),
+                          tileNode ? tileNode->getResult() : input, tiles[idx],
+                          axes[idx]);
+  }
+  return tileNode;
+}
+
 InsertTensorNode *Function::createInsertTensor(llvm::StringRef name,
                                                NodeValue big, NodeValue small,
                                                llvm::ArrayRef<dim_t> start,
@@ -1684,7 +1721,16 @@ ReshapeNode *Function::createExpandDims(llvm::StringRef name, NodeValue input,
 
 ReshapeNode *Function::createFlatten(llvm::StringRef name, NodeValue input,
                                      unsigned_t axis) {
-  auto xDim = flattenCdr(input.getType()->dims(), axis);
+  std::pair<dim_t, dim_t> xDim;
+  if (axis == 0) {
+    dim_t d = 1;
+    for (auto dim : input.getType()->dims()) {
+      d *= dim;
+    }
+    xDim = {1, d};
+  } else {
+    xDim = flattenCdr(input.getType()->dims(), axis);
+  }
   return createReshape(name, input, {xDim.first, xDim.second});
 }
 
@@ -1731,6 +1777,14 @@ BatchNormalizationNode *Function::createBatchNormalization(
   return addNode(new BatchNormalizationNode(name, resType, input, scale, beta,
                                             mean, var, channelIdx, epsilon,
                                             momentum));
+}
+
+InstanceNormalizationNode *
+Function::createInstanceNormalization(llvm::StringRef name, NodeValue input,
+                                      NodeValue beta, NodeValue scale,
+                                      unsigned_t channelIdx, float epsilon) {
+  return addNode(new InstanceNormalizationNode(name, input, scale, beta,
+                                               channelIdx, epsilon));
 }
 
 LayerNormalizationNode *
@@ -2597,16 +2651,27 @@ GaussianFillNode *Function::createGaussianFill(llvm::StringRef name,
   return addNode(new GaussianFillNode(name, outTy, input, mean, scale, seed));
 }
 
-SparseToDenseNode *Function::createSparseToDense(llvm::StringRef name,
-                                                 NodeValue indices,
-                                                 NodeValue values,
-                                                 NodeValue dataToInferDim) {
-  // The dimensions of the output are the same as the values tensor except for
-  // the first dimension, which should match that of dataToInferDim.
-  ShapeVector outDims(values.dims().begin(), values.dims().end());
-  outDims[0] = dataToInferDim.dims()[0];
+BatchSparseToDenseNode *Function::createBatchSparseToDense(
+    llvm::StringRef name, NodeValue lengths, NodeValue indices,
+    NodeValue values, float defaultValue, unsigned_t denseLastDim) {
+  // The output is a 2-D tensor with first dim = number of lengths and second
+  // dim = denseLastDim
+  ShapeVector outDims({lengths.dims()[0], denseLastDim});
   auto outTy = getParent()->uniqueTypeWithNewShape(values.getType(), outDims);
-  return addNode(new SparseToDenseNode(name, outTy, indices, values));
+  return addNode(new BatchSparseToDenseNode(
+      name, outTy, lengths, indices, values, defaultValue, denseLastDim));
+}
+
+FillExamplesWithIndicatorNode *
+Function::createFillExamplesWithIndicator(llvm::StringRef name, NodeValue data,
+                                          NodeValue indicator) {
+  ShapeVector outDims({indicator.dims()[0]});
+  if (data.dims().size() > 1) {
+    outDims.insert(outDims.end(), data.dims().begin() + 1, data.dims().end());
+  }
+  auto outTy = getParent()->uniqueTypeWithNewShape(data.getType(), outDims);
+  return addNode(
+      new FillExamplesWithIndicatorNode(name, outTy, data, indicator));
 }
 
 SparseToDenseMaskNode *Function::createSparseToDenseMask(
@@ -2831,42 +2896,58 @@ CollectRpnProposalsNode *Function::createCollectRpnProposals(
 }
 
 GatherNode *Function::createGather(llvm::StringRef name, NodeValue data,
-                                   NodeValue indices, unsigned_t batchDims) {
+                                   NodeValue indices, unsigned_t axis) {
   auto dDims = data.dims();
   auto iDims = indices.dims();
-  assert(dDims.size() > batchDims);
+  assert(dDims.size() > axis);
   ShapeVector outDims;
-  outDims.insert(outDims.end(), dDims.begin(), dDims.begin() + batchDims);
+  outDims.insert(outDims.end(), dDims.begin(), dDims.begin() + axis);
   outDims.insert(outDims.end(), iDims.begin(), iDims.end());
-  outDims.insert(outDims.end(), dDims.begin() + batchDims + 1, dDims.end());
+  outDims.insert(outDims.end(), dDims.begin() + axis + 1, dDims.end());
   return addNode(new GatherNode(
       name, getParent()->uniqueTypeWithNewShape(data.getType(), outDims), data,
-      indices, batchDims));
+      indices, axis));
 }
 
 GatherNDNode *Function::createGatherND(llvm::StringRef name, NodeValue data,
-                                       NodeValue indices) {
-  auto dDims = data.dims();
-  auto iDims = indices.dims();
-  int64_t lastIndicesDimension = iDims[iDims.size() - 1];
-  assert(dDims.size() > 0 && "data/input rank must be >= 1.");
-  assert(iDims.size() > 0 && "indices rank must be >= 1.");
-  assert(iDims[iDims.size() - 1] <= dDims.size() &&
-         "last dimension of indices can be at most rank of data/input");
+                                       NodeValue indices,
+                                       unsigned_t batchDims) {
+  auto dataDims = data.dims();
+  auto indicesDims = indices.dims();
+  size_t indicesDimLast = indicesDims.back();
 
-  int64_t outRank = dDims.size() + iDims.size() - lastIndicesDimension - 1;
-  std::vector<dim_t> outDimsGatherND(outRank);
-  size_t i = 0;
-  for (; i < iDims.size() - 1; i++) {
-    outDimsGatherND[i] = iDims[i];
+  // Validate the input dimensions.
+  assert(dataDims.size() >= 1 && "Input data rank must be >= 1.");
+  assert(indicesDims.size() >= 1 && "Input indices rank must be >= 1.");
+  for (size_t idx = 0; idx < batchDims; ++idx) {
+    assert(dataDims[idx] == indicesDims[idx] &&
+           "Batch dimensions of data and indices must be the same!");
   }
-  for (size_t j = lastIndicesDimension; j < dDims.size(); i++, j++) {
-    outDimsGatherND[i] = dDims[j];
-  }
+  assert(batchDims < std::min(dataDims.size(), indicesDims.size()) &&
+         "The number of batch dimensions must be smaller than both the input "
+         "data and indices rank!");
+  assert(indicesDimLast >= 1 &&
+         "Last dimension of indices must be at least 1!");
+  assert(indicesDimLast <= (dataDims.size() - batchDims) &&
+         "Last dimension of indices must be at most rank of data without batch "
+         "dimensions!");
 
-  auto outTy =
-      getParent()->uniqueTypeWithNewShape(data.getType(), outDimsGatherND);
-  return addNode(new GatherNDNode(name, outTy, data, indices));
+  // Compute the output dimensions.
+  size_t outRank =
+      dataDims.size() + indicesDims.size() - indicesDimLast - 1 - batchDims;
+  std::vector<dim_t> outDims(outRank);
+  size_t outIdx = 0;
+  for (size_t idx = 0; idx < batchDims; ++idx) {
+    outDims[outIdx++] = dataDims[idx];
+  }
+  for (size_t idx = batchDims; idx < indicesDims.size() - 1; ++idx) {
+    outDims[outIdx++] = indicesDims[idx];
+  }
+  for (size_t idx = batchDims + indicesDimLast; idx < dataDims.size(); ++idx) {
+    outDims[outIdx++] = dataDims[idx];
+  }
+  auto outTy = getParent()->uniqueTypeWithNewShape(data.getType(), outDims);
+  return addNode(new GatherNDNode(name, outTy, data, indices, batchDims));
 }
 
 GatherElementsNode *Function::createGatherElements(llvm::StringRef name,
@@ -2943,7 +3024,8 @@ ReshapeNode *Function::createDepthToSpace(llvm::StringRef name, NodeValue input,
   dim_t H = inputDim[1];
   dim_t W = inputDim[2];
   dim_t C = inputDim[3];
-  assert(C % blockSize == 0 && "Depth should be divisible by block size.");
+  assert(C % (blockSize * blockSize) == 0 &&
+         "Depth should be divisible by block size squared.");
 
   llvm::SmallVector<unsigned_t, 6> shuffle;
   llvm::SmallVector<dim_t, 6> tmpShape;
@@ -3172,6 +3254,67 @@ ClipNode *Function::createClipMinMaxBFloat16(llvm::StringRef name,
   constexpr float bfloat16Min = FLT_MIN;
   constexpr float bfloat16Max = FLT_MAX;
   return createClip(name, input, bfloat16Min, bfloat16Max);
+}
+
+BatchedUnaryEmbeddingsBagsNode *Function::createBatchedUnaryEmbeddingsBags(
+    llvm::StringRef name, NodeValue weights, NodeValue tableOffsets,
+    NodeValue indices, NodeValue offsets) {
+  auto inDims = weights.dims();
+  ShapeVector outDims(inDims.begin(), inDims.end());
+  outDims[0] = weights.dims()[0];
+  outDims[2] = tableOffsets.dims()[0] - 1;
+  outDims[1] = (offsets.dims()[0] - 1) / outDims[2];
+
+  auto outTy = getParent()->uniqueTypeWithNewShape(weights.getType(), outDims);
+  return addNode(new BatchedUnaryEmbeddingsBagsNode(
+      name, outTy, weights, tableOffsets, offsets, indices));
+}
+
+IntNBitSplitEmbeddingBagsNode *Function::createIntNBitSplitEmbeddingBags(
+    llvm::StringRef name, NodeValue devWeights, NodeValue uvmWeights,
+    NodeValue weightsPlacements, NodeValue weightsOffsets, NodeValue weightsTys,
+    NodeValue dimOffsets, int64_t totalDims, NodeValue indices,
+    NodeValue offsets, SplitEmbeddingPoolingMode poolingMode,
+    SplitEmbeddingSparseType outputDtype) {
+  ShapeVector outDims;
+  outDims.insert(outDims.end(),
+                 (offsets.dims()[0] - 1) / (dimOffsets.dims()[0] - 1));
+  int64_t totalSize = outputDtype == SplitEmbeddingSparseType::EST_FLOAT
+                          ? totalDims * sizeof(float)
+                          : totalDims * sizeof(float16_t);
+  outDims.insert(outDims.end(), totalSize);
+
+  auto outTy =
+      getParent()->uniqueTypeWithNewShape(devWeights.getType(), outDims);
+
+  return addNode(new IntNBitSplitEmbeddingBagsNode(
+      name, outTy, devWeights, uvmWeights, weightsPlacements, weightsOffsets,
+      weightsTys, dimOffsets, indices, offsets, totalDims, poolingMode,
+      outputDtype));
+}
+
+IntNBitSplitEmbeddingWeightedBagsNode *
+Function::createIntNBitSplitEmbeddingWeightedBags(
+    llvm::StringRef name, NodeValue devWeights, NodeValue uvmWeights,
+    NodeValue weightsPlacements, NodeValue weightsOffsets, NodeValue weightsTys,
+    NodeValue dimOffsets, int64_t totalDims, NodeValue indices,
+    NodeValue offsets, SplitEmbeddingPoolingMode poolingMode,
+    SplitEmbeddingSparseType outputDtype, NodeValue indiceWeights) {
+  ShapeVector outDims;
+  outDims.insert(outDims.end(),
+                 (offsets.dims()[0] - 1) / (dimOffsets.dims()[0] - 1));
+  int64_t totalSize = outputDtype == SplitEmbeddingSparseType::EST_FLOAT
+                          ? totalDims * sizeof(float)
+                          : totalDims * sizeof(float16_t);
+  outDims.insert(outDims.end(), totalSize);
+
+  auto outTy =
+      getParent()->uniqueTypeWithNewShape(devWeights.getType(), outDims);
+
+  return addNode(new IntNBitSplitEmbeddingWeightedBagsNode(
+      name, outTy, devWeights, uvmWeights, weightsPlacements, weightsOffsets,
+      weightsTys, dimOffsets, indices, offsets, indiceWeights, totalDims,
+      poolingMode, outputDtype));
 }
 
 //===----------------------------------------------------------------------===//
@@ -3999,7 +4142,7 @@ void Function::createPyTorchLSTM(llvm::StringRef namePrefix, NodeValue input,
                                  NodeValue WhR, NodeValue BxR, NodeValue BhR) {
   std::string nameBase = namePrefix.str();
   assert(input.dims().back() > 0 && "input dimensionality is zero");
-  assert((!isBidirectional || WxR != nullptr) &&
+  assert((!isBidirectional || WxR != NodeValue(nullptr)) &&
          "Bidirectional LSTM must provide reverse weights & biases");
   assert(Wx.size() > 0 && Wh.size() > 0 && Bx.size() > 0 && Bh.size() > 0 &&
          "Wx, Wh, Bx and Bh should be non empty vectors");
@@ -5256,6 +5399,58 @@ NonMaxSuppressionNode *Function::createNonMaxSuppressionONNX(
       maxOutputBoxesPerClass, iouThreshold, scoreThreshold, false));
 }
 
+TFLiteDetectionPostProcessNode *Function::createTFLiteDetectionPostProcess(
+    llvm::StringRef name, NodeValue boxes, NodeValue scores, NodeValue anchors,
+    int32_t numClasses, int32_t maxDetections, int32_t maxClassesPerDetection,
+    int32_t maxDetectionsPerClass, float iouThreshold, float scoreThreshold,
+    float xScale, float yScale, float hScale, float wScale, bool regularNMS) {
+
+  // Maximum number of detections depending on fast/regular method.
+  dim_t numBoxes = anchors.dims()[0];
+  dim_t fastMaxDetections =
+      std::min(numBoxes, static_cast<dim_t>(maxDetections));
+  dim_t regularMaxDetections = maxDetections;
+  dim_t numMaxDetections =
+      regularNMS ? regularMaxDetections : fastMaxDetections;
+
+  // Create output types. We allocate enough size for the worst possible case
+  // when the maximum number of detections is obtained.
+  std::vector<dim_t> detectionBoxesDims = {static_cast<dim_t>(numMaxDetections),
+                                           4};
+  TypeRef detectionBoxesTy =
+      getParent()->uniqueType(ElemKind::FloatTy, detectionBoxesDims);
+  std::vector<dim_t> detectionClassesDims = {
+      static_cast<dim_t>(numMaxDetections)};
+  TypeRef detectionClassesTy =
+      getParent()->uniqueType(ElemKind::Int32ITy, detectionClassesDims);
+  std::vector<dim_t> detectionScoresDims = {
+      static_cast<dim_t>(numMaxDetections)};
+  TypeRef detectionScoresTy =
+      getParent()->uniqueType(ElemKind::FloatTy, detectionScoresDims);
+  TypeRef numDetectionsTy = getParent()->uniqueType(ElemKind::Int32ITy, {1});
+
+  // Dequantize inputs if quantized.
+  if (boxes.getType()->isQuantizedType()) {
+    boxes = createDequantize(name.str() + ".dequant.boxes", boxes,
+                             ElemKind::FloatTy);
+  }
+  if (scores.getType()->isQuantizedType()) {
+    scores = createDequantize(name.str() + ".dequant.scores", scores,
+                              ElemKind::FloatTy);
+  }
+  if (anchors.getType()->isQuantizedType()) {
+    anchors = createDequantize(name.str() + ".dequant.anchors", anchors,
+                               ElemKind::FloatTy);
+  }
+
+  // Create node.
+  return addNode(new TFLiteDetectionPostProcessNode(
+      name, detectionBoxesTy, detectionClassesTy, detectionScoresTy,
+      numDetectionsTy, boxes, scores, anchors, numClasses, maxDetections,
+      maxClassesPerDetection, maxDetectionsPerClass, iouThreshold,
+      scoreThreshold, xScale, yScale, hScale, wScale, regularNMS));
+}
+
 Constant *Function::createCosineWindow(llvm::StringRef name, dim_t length) {
   auto window = getParent()->createConstant(ElemKind::FloatTy, {length}, name);
   auto windowH = window->getHandle<float>();
@@ -5527,8 +5722,9 @@ ExternalFunctionCallNode *Function::createExternalFunctionCall(
     llvm::StringRef name, TypeRef outTy, llvm::ArrayRef<glow::NodeValue> inputs,
     llvm::StringRef funcName, llvm::StringRef funcImpl,
     llvm::StringRef funcKind) {
-  return addNode(new ExternalFunctionCallNode(name, outTy, inputs, funcName,
-                                              funcImpl, funcKind));
+  return addNode(new ExternalFunctionCallNode(name.str(), outTy, inputs,
+                                              funcName.str(), funcImpl.str(),
+                                              funcKind.str()));
 }
 
 //===----------------------------------------------------------------------===//
@@ -5641,6 +5837,31 @@ std::string Function::dumpDAG() {
   return std::string(dotPath.begin(), dotPath.end());
 }
 
+/// Local utility function to convert an existing DOT file \p dotFile to
+/// the right format suggested by the file name extension. For example if
+/// the file name ends with ".pdf" then the file will be converted to PDF.
+/// For conversion we use the "dot" application (assumed available) and
+/// the conversion is done in place.
+static void convertDotFileToRightFormat(llvm::StringRef dotFile) {
+  static const std::vector<std::string> supportedFormats = {"pdf", "svg",
+                                                            "png"};
+  // Get file extension.
+  llvm::StringRef extWithDot = llvm::sys::path::extension(dotFile);
+  std::string ext = extWithDot.take_back(extWithDot.size() - 1).str();
+  // Convert to new format if supported.
+  if (std::find(supportedFormats.begin(), supportedFormats.end(), ext) !=
+      supportedFormats.end()) {
+    std::string cmd =
+        "dot -T" + ext + " " + dotFile.str() + " -o " + dotFile.str();
+    std::string cmdErr =
+        "Error running DOT conversion application with command '" + cmd +
+        "'! Check that you have the 'dot' application installed on your "
+        "system in order to convert files from DOT format to other formats! "
+        "Otherwise choose the extension of the DOT file to '.dot'!";
+    CHECK(!system(cmd.c_str())) << cmdErr;
+  }
+}
+
 void Function::dumpDAG(llvm::StringRef dotFilename) {
   llvm::StringRef legalDotFilename = dotFilename.take_back(255);
   llvm::outs() << "Writing dotty graph for Function to: " << legalDotFilename
@@ -5664,6 +5885,7 @@ void Function::dumpDAG(llvm::StringRef dotFilename) {
     DP.dumpAll(myfile);
   }
   myfile.close();
+  convertDotFileToRightFormat(legalDotFilename);
 }
 
 void Function::dumpDAG(const char *dotFilename) {

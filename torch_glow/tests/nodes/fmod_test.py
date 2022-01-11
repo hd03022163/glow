@@ -1,3 +1,17 @@
+# Copyright (c) Glow Contributors. See CONTRIBUTORS file.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 import torch
@@ -14,17 +28,23 @@ class SimpleFmodModule(torch.nn.Module):
             c = a.fmod(b.item())
         else:
             c = a.fmod(b)
-        return c.fmod(1.0)
+        return c.fmod(torch.tensor(1.0, dtype=c.dtype))
 
 
 class TestFmod(utils.TorchGlowTestCase):
     @utils.deterministic_expand(
         [
             lambda: (
-                "int_tensor",
+                "int64_tensor",
                 SimpleFmodModule(),
                 torch.tensor([14]),
                 torch.tensor([10]),
+            ),
+            lambda: (
+                "int32_tensor",
+                SimpleFmodModule(),
+                torch.tensor([14], dtype=torch.int32),
+                torch.tensor([10], dtype=torch.int32),
             ),
             lambda: (
                 "float_tensor",

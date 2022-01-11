@@ -19,9 +19,11 @@
 #include "glow/Converter/TypeAToTypeBFunctionConverter.h"
 #include "glow/ExecutionEngine/ExecutionEngine.h"
 #include "glow/Exporter/ONNXModelWriter.h"
+#include "glow/Flags/Flags.h"
 #include "glow/Graph/Graph.h"
 #include "glow/Partitioner/Partitioner.h"
 #include "glow/Runtime/DeferredWeightLoader.h"
+#include "glow/Runtime/HostManager/HostManager.h"
 #include "lib/Onnxifi/Base.h"
 
 #include <algorithm>
@@ -141,6 +143,12 @@ llvm::cl::opt<unsigned> numDevicesOpt(
     "num-devices", llvm::cl::desc("Number of devices to use for partitioning."),
     llvm::cl::Optional, llvm::cl::init(2), llvm::cl::cat(recSysTestCat));
 
+llvm::cl::opt<unsigned> partitioningNumDevicesOpt(
+    "partitioning-num-devices",
+    llvm::cl::desc(
+        "Number of devices to override sparseNNPartitioningNumCards."),
+    llvm::cl::Optional, llvm::cl::init(1), llvm::cl::cat(recSysTestCat));
+
 llvm::cl::opt<std::string> traceDir(
     "trace-dir",
     llvm::cl::desc("Directory used to store Glow trace events files. If not "
@@ -158,11 +166,27 @@ llvm::cl::opt<bool> dumpModelInputs(
         "Dump model and inputs into format that repro binary can run."),
     llvm::cl::init(false), llvm::cl::cat(recSysTestCat));
 
+llvm::cl::opt<bool> dumpFinalGraph(
+    "dump-final-graph",
+    llvm::cl::desc(
+        "Call dumpDag on each Function passed to the backend for compilation."),
+    llvm::cl::init(false), llvm::cl::cat(recSysTestCat));
+
+llvm::cl::opt<bool> saturateHost("saturate-host",
+                                 llvm::cl::desc("Enable host saturation."),
+                                 llvm::cl::init(false),
+                                 llvm::cl::cat(recSysTestCat));
+
 llvm::cl::opt<bool> fuseScaleOffsetFp32Opt(
     "glow_global_fused_scale_offset_fp32",
     llvm::cl::desc(
         "Enable converting scale/offset in sls's input data from fp16 to fp32"),
     llvm::cl::init(false), llvm::cl::cat(recSysTestCat));
+
+llvm::cl::opt<bool> skipCorrectnessCheck(
+    "skip_correctness_check",
+    llvm::cl::desc("Skip correctness check with Interpreter backend"),
+    llvm::cl::Optional, llvm::cl::init(false), llvm::cl::cat(recSysTestCat));
 } // namespace
 
 class TestDeferredWeightLoader : public DeferredWeightLoader {
@@ -281,6 +305,7 @@ protected:
   ExecutionContext context_;
   PlaceholderBindings *bindings_;
   PrecisionConfiguration precConfig_;
+  PrecisionConfiguration precConfigForInterpreter_;
 
   // Test Config:
   dim_t miniBatch;
@@ -291,7 +316,6 @@ protected:
   std::vector<dim_t> topMLPIntermediateDims;
   size_t lengthsMin;
   size_t lengthsMax;
-  bool enableStaticPlaceholder;
 
   // Used to configure correct precision settings:
   bool quantizeSLWSData{false};
@@ -300,8 +324,18 @@ protected:
   bool useFP16SLWS{false};
   bool useFP16AccumSLWS{false};
 
+  bool convertFusedToFP16{false};
+  bool convert4or8BitFusedToFP32{false};
+
+  // Used to enable static placeholder:
+  bool enableStaticPlaceholder{false};
+
   // Whether to use SLWS with gather of weights, instead of SLS.
   bool gatherWeights{false};
+
+  // Used to disable Interpreter deferred weight loading, because we run
+  // FBA and Interpreter tests sequentially.
+  bool isInterpreter{false};
 
   // Partitioner config:
   uint64_t deviceMemCapacity;
@@ -350,7 +384,6 @@ protected:
     denseDim = denseDimOpt;
     lengthsMin = 90;
     lengthsMax = 111;
-    enableStaticPlaceholder = enableStaticPlaceholderOpt;
 
     if (!tableSizesOpt.empty()) {
       if (!tableCountsOpt.empty()) {
@@ -413,8 +446,23 @@ protected:
       const auto &resultTensor = pair.second;
       ONNXModelWriter::writeTensor(resultTensor, t,
                                    /*useGlowCustomOps*/ true);
-      t->set_name(PH->getName());
+      t->set_name(PH->getName().str());
     }
+    std::string buffer;
+    inputG.SerializeToString(&buffer);
+    of << buffer;
+  }
+
+  // dump outputs into onnx file which can run with repro binary.
+  void dumpOutputs() {
+    std::stringstream ss;
+    ss << "output_0.onnx";
+    std::ofstream of(ss.str(), std::ios::binary);
+    ONNX_NAMESPACE::GraphProto inputG;
+    auto *t = inputG.add_initializer();
+    ONNXModelWriter::writeTensor(*resultTensor, t,
+                                 /*useGlowCustomOps*/ true);
+    t->set_name("save");
     std::string buffer;
     inputG.SerializeToString(&buffer);
     of << buffer;
@@ -655,21 +703,30 @@ protected:
       // output is size {MB, embDim}
       if (quantizeSLWSData) {
         Storage *data;
-        if (enableStaticPlaceholder) {
+        if (!isInterpreter && enableStaticPlaceholder) {
           Placeholder *ph = createFusedRowwiseQuantizedPlaceholder(
               mod, {embSizes[i], embDim}, "data" + std::to_string(i),
               useFP16SLWS);
 
           ph->setStatic(true);
           auto *tensor = loader.addWeight(ph->getType());
-          tensor->getHandle<uint8_t>().randomize(UINT8_MIN, UINT8_MAX,
-                                                 mod.getPRNG());
+          auto fData = Tensor(ElemKind::FloatTy, {embSizes[i], embDim});
+          fData.getHandle<uint8_t>().randomize(UINT8_MIN, UINT8_MAX,
+                                               mod.getPRNG());
           loader.addName("data" + std::to_string(i));
 
           bindings_.allocate(ph);
           updateInputPlaceholders(bindings_, {ph}, {tensor});
 
           data = ph;
+
+          Tensor rwqData(ElemKind::UInt8FusedQTy,
+                         {embSizes[i], embDim + 2 * (dim_t)sizeof(float)},
+                         data->getType()->getScale(),
+                         data->getType()->getOffset());
+
+          quantization::tensorFusedRowwiseQuantization<float>(fData, rwqData);
+          tensor->assign(&rwqData);
         } else {
           data = createRandomFusedRowwiseQuantizedConstant(
               mod, {embSizes[i], embDim}, "data" + std::to_string(i),
@@ -688,7 +745,7 @@ protected:
         }
       } else {
         Storage *data;
-        if (enableStaticPlaceholder) {
+        if (!isInterpreter && enableStaticPlaceholder) {
           Placeholder *ph =
               mod.createPlaceholder(ElemKind::FloatTy, {embSizes[i], embDim},
                                     "data" + std::to_string(i), false);
@@ -715,6 +772,7 @@ protected:
 
   /// Creates a number of Sparse tables (FP32 or Int8Q), the Indices lookup and
   /// the SpareLengthsSum Node tying it together.
+  /// TODO: we need to quantize the data tensors for deferred weight loading.
   void createSparseWeightedGatherEmbeddings(
       Module &mod, PlaceholderBindings &bindings_, Function *F_,
       TestDeferredWeightLoader &loader, llvm::ArrayRef<Placeholder *> lengths,
@@ -751,7 +809,7 @@ protected:
       // output is size {MB, embeddingDim_}
       if (quantizeSLWSData) {
         Storage *data;
-        if (enableStaticPlaceholder) {
+        if (!isInterpreter && enableStaticPlaceholder) {
           Placeholder *ph = createFusedRowwiseQuantizedPlaceholder(
               mod, {tableSizes[i], embeddingDim}, "data" + std::to_string(i),
               useFP16SLWS);
@@ -784,7 +842,7 @@ protected:
         }
       } else {
         Storage *data;
-        if (enableStaticPlaceholder) {
+        if (!isInterpreter && enableStaticPlaceholder) {
           Placeholder *ph = mod.createPlaceholder(
               ElemKind::FloatTy, {tableSizes[i], embeddingDim},
               "data" + std::to_string(i), false);
@@ -896,8 +954,9 @@ protected:
   void setupPrecisionConfig() {
     if (convertToFP16) {
       precConfig_.convertToFP16 = convertToFP16;
-      // For now always convert both or neither.
-      precConfig_.convertFusedToFP16 = convertToFP16;
+      precConfig_.convertFusedToFP16 = convertFusedToFP16;
+      precConfig_.convert4BitFusedToFP32 = convert4or8BitFusedToFP32;
+      precConfig_.convert8BitFusedToFP32 = convert4or8BitFusedToFP32;
       // Note: always do not convert RWQ-SLWS here. The creator itself for
       // precisionForNonDataSLWS already directly created the node with the
       // correct precision.
@@ -909,6 +968,25 @@ protected:
     if (fuseScaleOffsetFp32Opt) {
       precConfig_.convert4BitFusedToFP32 = fuseScaleOffsetFp32Opt;
       precConfig_.convert8BitFusedToFP32 = fuseScaleOffsetFp32Opt;
+    }
+  }
+
+  /// Set up the precision configuration for Interpreter.
+  void setupPrecisionConfigforInterpreter() {
+    if (convertToFP16) {
+      precConfigForInterpreter_.convertToFP16 = convertToFP16;
+      precConfigForInterpreter_.convertFusedToFP16 = convertToFP16;
+      // Note: always do not convert RWQ-SLWS here. The creator itself for
+      // precisionForNonDataSLWS already directly created the node with the
+      // correct precision.
+      precConfigForInterpreter_.precisionModeKindSet.insert(
+          Kinded::Kind::FusedRowwiseQuantizedSparseLengthsWeightedSumNodeKind);
+      precConfigForInterpreter_.precisionModeKindSet.insert(
+          Kinded::Kind::RowwiseQuantizedFullyConnectedNodeKind);
+    }
+    if (fuseScaleOffsetFp32Opt) {
+      precConfigForInterpreter_.convert4BitFusedToFP32 = fuseScaleOffsetFp32Opt;
+      precConfigForInterpreter_.convert8BitFusedToFP32 = fuseScaleOffsetFp32Opt;
     }
   }
 
@@ -938,7 +1016,7 @@ protected:
   void testRecSys(bool checkConcat = false) {
     assert((!useFP16AccumSLWS || useFP16SLWS) &&
            "Can only use FP16 accumulation when using FP16 precision.");
-
+    isInterpreter = false;
     setupPrecisionConfig();
 
     // Generate the network.
@@ -968,8 +1046,12 @@ protected:
     DeferredLoader()->registerLoader(&loader);
 
     CompilationContext cctx;
+    if (enableStaticPlaceholder) {
+      cctx.optimizationOpts.foldStaticPlaceholderConversions = true;
+    }
     cctx.precisionConfig = precConfig_;
     cctx.deferredWeightLoader = &loader;
+    cctx.dumpFinalGraph = dumpFinalGraph;
     EXIT_ON_ERR(hostManager->addNetwork(std::move(mod), cctx));
 
     // Run graph
@@ -1013,14 +1095,31 @@ protected:
       }
     }
 
+    if (dumpModelInputs) {
+      dumpOutputs();
+    }
+
+    // Undeploy the network.
+    CHECK(!ERR_TO_BOOL(hostManager->removeNetwork("main")))
+        << "Could not remove the network";
+    // Free memory.
+    hostManager.reset();
+    mod.reset();
+
     // Compare against interpreter if we're not executing already on it.
-    if (getBackendName() != "Interpreter") {
+    if (!skipCorrectnessCheck && getBackendName() != "Interpreter") {
       compareAgainstInterpreter();
+    } else {
+      std::cout << "Skip correctness check with Interpreter backend"
+                << std::endl;
     }
   }
 
   /// Run on the Interpreter and compare the result to previous result.
   void compareAgainstInterpreter() {
+    isInterpreter = true;
+    setupPrecisionConfigforInterpreter();
+
     ExecutionContext contextI;
     // Create a new module for the interpreter run.
     std::unique_ptr<Module> modI(new Module);
@@ -1041,7 +1140,7 @@ protected:
 
     // Use the same precision transformation for compilation.
     CompilationContext cctx;
-    cctx.precisionConfig = precConfig_;
+    cctx.precisionConfig = precConfigForInterpreter_;
     cctx.deferredWeightLoader = &loaderI;
     EXIT_ON_ERR(hostManager->addNetwork(std::move(modI), cctx));
     dispatchInference("main", hostManager.get(), contextI,
@@ -1055,6 +1154,7 @@ protected:
   /// Create partitions to run and compare results.
   void testPartitionedRecSys(size_t numDevices, size_t memSize,
                              ExecutionContext &context) {
+    isInterpreter = false;
     // Result tensors are reused below, so create a local copy.
     Tensor referenceResultT = resultTensor->clone();
     // Generate configs and create a new HostManager for testing partitioning.
@@ -1082,6 +1182,9 @@ protected:
 
     // Use the same precision transformation for compilation.
     CompilationContext cctx;
+    if (enableStaticPlaceholder) {
+      cctx.optimizationOpts.foldStaticPlaceholderConversions = true;
+    }
     cctx.precisionConfig = precConfig_;
     cctx.deferredWeightLoader = &loaderP;
     cctx.optimizationOpts.useSparseNNPartitioningScheme =
@@ -1096,10 +1199,11 @@ protected:
         sparseNNPartitioningNumCoresSLS;
     cctx.optimizationOpts.sparseNNPartitioningSchemeNumCoresOther =
         sparseNNPartitioningNumCoresOther;
+    cctx.dumpFinalGraph = dumpFinalGraph;
+    cctx.saturateHost = saturateHost;
     EXIT_ON_ERR(hostManager->addNetwork(std::move(modP), cctx));
     std::cout << "Partitions = " << rawModule->getFunctions().size()
               << std::endl;
-    ASSERT_LE(rawModule->getFunctions().size(), numDevices);
 
     // Run the partitioned graph and compare the results.
     auto &bindings = *context.getPlaceholderBindings();
@@ -1114,11 +1218,16 @@ protected:
 
     Tensor *resultTensorP =
         bindings.get(bindings.getPlaceholderByNameSlow("save"));
-    EXPECT_TRUE(referenceResultT.isEqual(*resultTensorP));
+    if (enableStaticPlaceholder) {
+      EXPECT_TRUE(referenceResultT.isEqual(*resultTensorP, 0.005));
+    } else {
+      EXPECT_TRUE(referenceResultT.isEqual(*resultTensorP));
+    }
   }
 
   /// Test SparseLengthsSum independently.
   void testSLSQuant() {
+    isInterpreter = false;
     std::unique_ptr<Module> mod(new Module);
     TestDeferredWeightLoader loader;
     F_ = mod->createFunction("main");
@@ -1137,6 +1246,9 @@ protected:
 
     // Use the same precision transformation for compilation.
     CompilationContext cctx;
+    if (enableStaticPlaceholder) {
+      cctx.optimizationOpts.foldStaticPlaceholderConversions = true;
+    }
     cctx.precisionConfig = precConfig_;
     cctx.deferredWeightLoader = &loader;
     auto configs = generateDeviceConfigs(1, getBackendName(), MAX_MEMORY);
@@ -1184,6 +1296,22 @@ TEST_P(RecommendationSystemTest, RecSys_FP32) {
   testRecSys();
 }
 
+// RecSys_FP32 with deferred weight loading.
+TEST_P(RecommendationSystemTest, RecSys_FP32_Deferred) {
+  CHECK_IF_ENABLED();
+
+  quantizeSLWSData = false;
+  useFP16SLWS = false;
+  useFP16AccumSLWS = false;
+  quantizeFC = false;
+  convertToFP16 = true;
+  enableStaticPlaceholder = true;
+  convertFusedToFP16 = false;
+  convert4or8BitFusedToFP32 = true;
+
+  testRecSys();
+}
+
 /// Rowwise quantize the SLWS and FC; everything else in FP32.
 TEST_P(RecommendationSystemTest, RecSys_RWQuantized_SLWS_FC) {
   CHECK_IF_ENABLED();
@@ -1193,6 +1321,23 @@ TEST_P(RecommendationSystemTest, RecSys_RWQuantized_SLWS_FC) {
   useFP16AccumSLWS = false;
   quantizeFC = true;
   convertToFP16 = false;
+
+  testRecSys();
+}
+
+// RecSys_RWQuantized_SLWS_FC with deferred weight loading.
+TEST_P(RecommendationSystemTest, RecSys_RWQuantized_SLWS_FC_Deferred) {
+  CHECK_IF_ENABLED();
+
+  quantizeSLWSData = true;
+  useFP16SLWS = false;
+  useFP16AccumSLWS = false;
+  quantizeFC = true;
+
+  enableStaticPlaceholder = true;
+  convertToFP16 = true;
+  convertFusedToFP16 = false;
+  convert4or8BitFusedToFP32 = true;
 
   testRecSys();
 }
@@ -1210,6 +1355,23 @@ TEST_P(RecommendationSystemTest, RecSys_RWQuantized_SLWS) {
   testRecSys();
 }
 
+// RecSys_RWQuantized_SLWS with deferred weight loading.
+TEST_P(RecommendationSystemTest, RecSys_RWQuantized_SLWS_Deferred) {
+  CHECK_IF_ENABLED();
+
+  quantizeSLWSData = true;
+  useFP16SLWS = false;
+  useFP16AccumSLWS = false;
+  quantizeFC = false;
+
+  enableStaticPlaceholder = true;
+  convertToFP16 = true;
+  convertFusedToFP16 = false;
+  convert4or8BitFusedToFP32 = true;
+
+  testRecSys();
+}
+
 /// Rowwise quantize the SLWS and FC; everything else in FP16.
 TEST_P(RecommendationSystemTest, RecSys_RWQuantized_SLWS_FC_FP16) {
   CHECK_IF_ENABLED();
@@ -1219,6 +1381,7 @@ TEST_P(RecommendationSystemTest, RecSys_RWQuantized_SLWS_FC_FP16) {
   useFP16AccumSLWS = false;
   quantizeFC = true;
   convertToFP16 = true;
+  convertFusedToFP16 = true;
 
   testRecSys();
 }
@@ -1232,6 +1395,24 @@ TEST_P(RecommendationSystemTest, RecSys_RWQuantized_SLWS_FP16) {
   useFP16AccumSLWS = false;
   quantizeFC = false;
   convertToFP16 = true;
+  convertFusedToFP16 = true;
+
+  testRecSys();
+}
+
+// RecSys_RWQuantized_SLWS_FP16 with deferred weight loading.
+TEST_P(RecommendationSystemTest, RecSys_RWQuantized_SLWS_FP16_Deferred) {
+  CHECK_IF_ENABLED();
+
+  quantizeSLWSData = true;
+  useFP16SLWS = false;
+  useFP16AccumSLWS = false;
+  quantizeFC = false;
+
+  enableStaticPlaceholder = true;
+  convertToFP16 = true;
+  convertFusedToFP16 = false;
+  convert4or8BitFusedToFP32 = true;
 
   testRecSys();
 }
@@ -1274,6 +1455,7 @@ TEST_P(RecommendationSystemTest, RecSys_RWQuantizedFP16_SLWS_FP16) {
   useFP16AccumSLWS = false;
   quantizeFC = false;
   convertToFP16 = true;
+  convertFusedToFP16 = true;
 
   testRecSys();
 }
@@ -1288,6 +1470,7 @@ TEST_P(RecommendationSystemTest, RecSys_RWQuantizedFP16AccumFP16_SLWS_FP16) {
   useFP16AccumSLWS = true;
   quantizeFC = false;
   convertToFP16 = true;
+  convertFusedToFP16 = true;
 
   testRecSys();
 }
@@ -1305,6 +1488,31 @@ TEST_P(RecommendationSystemTest, RecSys_FP32_Partitioned) {
   useFP16AccumSLWS = false;
   quantizeFC = false;
   convertToFP16 = false;
+
+  testRecSys();
+
+  // If the memory capacity was not set on the command line, then double the
+  // default value for this test.
+  if (deviceMemCapacityOpt == 0) {
+    deviceMemCapacity *= 2; // Double memory for this test
+  }
+
+  testPartitionedRecSys(numDevices, deviceMemCapacity, context_);
+}
+
+// RecSys_FP32_Partitioned with deferred weight loading.
+TEST_P(RecommendationSystemTest, RecSys_FP32_Partitioned_Deferred) {
+  CHECK_IF_ENABLED();
+
+  quantizeSLWSData = false;
+  useFP16SLWS = false;
+  useFP16AccumSLWS = false;
+  quantizeFC = false;
+
+  enableStaticPlaceholder = true;
+  convertToFP16 = true;
+  convertFusedToFP16 = false;
+  convert4or8BitFusedToFP32 = true;
 
   testRecSys();
 
@@ -1337,6 +1545,31 @@ TEST_P(RecommendationSystemTest, RecSys_Partitioned_RWQuantized_SLWS) {
   testPartitionedRecSys(numDevices, deviceMemCapacity, context_);
 }
 
+// RecSys_Partitioned_RWQuantized_SLWS with deferred weight loading.
+TEST_P(RecommendationSystemTest, RecSys_Partitioned_RWQuantized_SLWS_Deferred) {
+  CHECK_IF_ENABLED();
+
+  quantizeSLWSData = true;
+  useFP16SLWS = false;
+  useFP16AccumSLWS = false;
+  quantizeFC = false;
+
+  enableStaticPlaceholder = true;
+  convertToFP16 = true;
+  convertFusedToFP16 = false;
+  convert4or8BitFusedToFP32 = true;
+
+  testRecSys();
+
+  // If the memory capacity was not set on the command line, then double the
+  // default value for this test.
+  if (deviceMemCapacityOpt == 0) {
+    deviceMemCapacity *= 2; // Double memory for this test
+  }
+
+  testPartitionedRecSys(numDevices, deviceMemCapacity, context_);
+}
+
 TEST_P(RecommendationSystemTest, RecSys_Partitioned_RWQuantized_SLWS_FC) {
   CHECK_IF_ENABLED();
 
@@ -1351,6 +1584,26 @@ TEST_P(RecommendationSystemTest, RecSys_Partitioned_RWQuantized_SLWS_FC) {
   testPartitionedRecSys(numDevices, deviceMemCapacity, context_);
 }
 
+// RecSys_Partitioned_RWQuantized_SLWS_FC with deferred weight loading.
+TEST_P(RecommendationSystemTest,
+       RecSys_Partitioned_RWQuantized_SLWS_FC_Deferred) {
+  CHECK_IF_ENABLED();
+
+  quantizeSLWSData = true;
+  useFP16SLWS = false;
+  useFP16AccumSLWS = false;
+  quantizeFC = true;
+
+  enableStaticPlaceholder = true;
+  convertToFP16 = true;
+  convertFusedToFP16 = false;
+  convert4or8BitFusedToFP32 = true;
+
+  testRecSys();
+
+  testPartitionedRecSys(numDevices, deviceMemCapacity, context_);
+}
+
 TEST_P(RecommendationSystemTest, RecSys_Partitioned_RWQuantized_SLWS_FP16) {
   CHECK_IF_ENABLED();
 
@@ -1359,6 +1612,27 @@ TEST_P(RecommendationSystemTest, RecSys_Partitioned_RWQuantized_SLWS_FP16) {
   useFP16AccumSLWS = false;
   quantizeFC = false;
   convertToFP16 = true;
+  convertFusedToFP16 = true;
+
+  testRecSys();
+
+  testPartitionedRecSys(numDevices, deviceMemCapacity, context_);
+}
+
+// RecSys_Partitioned_RWQuantized_SLWS_FP16 with deferred weight loading.
+TEST_P(RecommendationSystemTest,
+       RecSys_Partitioned_RWQuantized_SLWS_FP16_Deferred) {
+  CHECK_IF_ENABLED();
+
+  quantizeSLWSData = true;
+  useFP16SLWS = false;
+  useFP16AccumSLWS = false;
+  quantizeFC = false;
+
+  enableStaticPlaceholder = true;
+  convertToFP16 = true;
+  convertFusedToFP16 = false;
+  convert4or8BitFusedToFP32 = true;
 
   testRecSys();
 
@@ -1373,6 +1647,7 @@ TEST_P(RecommendationSystemTest, RecSys_Partitioned_RWQuantized_SLWS_FC_FP16) {
   useFP16AccumSLWS = false;
   quantizeFC = true;
   convertToFP16 = true;
+  convertFusedToFP16 = true;
 
   testRecSys();
 
@@ -1390,6 +1665,32 @@ TEST_P(RecommendationSystemTest, RecSys_Partitioned_RWQuantizedFP16_SLWS) {
   useFP16AccumSLWS = false;
   quantizeFC = false;
   convertToFP16 = false;
+
+  testRecSys();
+
+  // If the memory capacity was not set on the command line, then double the
+  // default value for this test.
+  if (deviceMemCapacityOpt == 0) {
+    deviceMemCapacity *= 2; // Double memory for this test
+  }
+
+  testPartitionedRecSys(numDevices, deviceMemCapacity, context_);
+}
+
+// RecSys_Partitioned_RWQuantizedFP16_SLWS with deferred weight loading.
+TEST_P(RecommendationSystemTest,
+       RecSys_Partitioned_RWQuantizedFP16_SLWS_Deferred) {
+  CHECK_IF_ENABLED();
+
+  quantizeSLWSData = true;
+  useFP16SLWS = true;
+  useFP16AccumSLWS = false;
+  quantizeFC = false;
+
+  enableStaticPlaceholder = true;
+  convertToFP16 = true;
+  convertFusedToFP16 = false;
+  convert4or8BitFusedToFP32 = true;
 
   testRecSys();
 
@@ -1431,6 +1732,7 @@ TEST_P(RecommendationSystemTest, RecSys_Partitioned_RWQuantizedFP16_SLWS_FP16) {
   useFP16AccumSLWS = false;
   quantizeFC = false;
   convertToFP16 = true;
+  convertFusedToFP16 = true;
 
   testRecSys();
 
@@ -1449,6 +1751,7 @@ TEST_P(RecommendationSystemTest,
   useFP16AccumSLWS = true;
   quantizeFC = false;
   convertToFP16 = true;
+  convertFusedToFP16 = true;
 
   testRecSys();
 
@@ -1467,11 +1770,12 @@ TEST_P(RecommendationSystemTest,
   useFP16AccumSLWS = true;
   quantizeFC = false;
   convertToFP16 = true;
+  convertFusedToFP16 = true;
 
   // Options for SparseNN Partitioning
   useSparseNNPartitioning = true;
   sparseNNPartitioningAddSLSConcats = true;
-  sparseNNPartitioningNumCards = 1;
+  sparseNNPartitioningNumCards = partitioningNumDevicesOpt;
   sparseNNPartitioningSLSKbytes = 1000000;
   sparseNNPartitioningNumCoresSLS = 6;
   sparseNNPartitioningNumCoresOther = 4;
@@ -1486,6 +1790,22 @@ TEST_P(RecommendationSystemTest, RecSys_SLS_Only) {
   CHECK_IF_ENABLED();
 
   quantizeSLWSData = true;
+
+  // Normally called in testRecSys(), but we're bypassing it here.
+  setupPrecisionConfig();
+
+  testSLSQuant();
+}
+
+// RecSys_SLS_Only with deferred weight loading.
+TEST_P(RecommendationSystemTest, RecSys_SLS_Only_Deferred) {
+  CHECK_IF_ENABLED();
+
+  quantizeSLWSData = true;
+
+  enableStaticPlaceholder = true;
+  convertFusedToFP16 = false;
+  convert4or8BitFusedToFP32 = true;
 
   // Normally called in testRecSys(), but we're bypassing it here.
   setupPrecisionConfig();

@@ -1,3 +1,17 @@
+# Copyright (c) Glow Contributors. See CONTRIBUTORS file.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 import unittest
@@ -79,10 +93,10 @@ class TestQuantizedConv2d(utils.TorchGlowTestCase):
 
         model = torch.nn.Sequential(q, conv, dq)
         model.eval()
-        model.qconfig = torch.quantization.get_default_qconfig("fbgemm")
+        model.qconfig = torch.ao.quantization.get_default_qconfig("fbgemm")
 
-        torch.quantization.prepare(model, inplace=True)
-        torch.quantization.convert(model, inplace=True)
+        torch.ao.quantization.prepare(model, inplace=True)
+        torch.ao.quantization.convert(model, inplace=True)
 
         utils.compare_tracing_methods(
             model,
@@ -112,10 +126,10 @@ class TestQuantizedConv2d(utils.TorchGlowTestCase):
 
         model = torch.nn.Sequential(q, conv, dq)
         model.eval()
-        model.qconfig = torch.quantization.get_default_qconfig("fbgemm")
+        model.qconfig = torch.ao.quantization.get_default_qconfig("fbgemm")
 
-        torch.quantization.prepare(model, inplace=True)
-        torch.quantization.convert(model, inplace=True)
+        torch.ao.quantization.prepare(model, inplace=True)
+        torch.ao.quantization.convert(model, inplace=True)
 
         utils.compare_tracing_methods(
             model,
@@ -135,13 +149,13 @@ class TestQuantizedConv2d(utils.TorchGlowTestCase):
             conv.weight.random_(-1, 1)
             conv.bias.data.random_(-1, 1)
 
-            model = torch.quantization.QuantWrapper(conv)
-            model.qconfig = torch.quantization.get_default_qconfig("fbgemm")
+            model = torch.ao.quantization.QuantWrapper(conv)
+            model.qconfig = torch.ao.quantization.get_default_qconfig("fbgemm")
 
-            torch.quantization.prepare(model, inplace=True)
+            torch.ao.quantization.prepare(model, inplace=True)
             # Calibration
             model.forward(x)
-            torch.quantization.convert(model, inplace=True)
+            torch.ao.quantization.convert(model, inplace=True)
 
             # TODO: acuracy needs to be investigated. Average acuracy is decent
             # but some elements have errors (possibly from rounding differences)
@@ -161,9 +175,9 @@ class TestQuantizedConv2d(utils.TorchGlowTestCase):
         class SerialQuantizedConvModel(torch.nn.Module):
             def __init__(self):
                 super(SerialQuantizedConvModel, self).__init__()
-                self.qconfig = torch.quantization.get_default_qconfig("fbgemm")
+                self.qconfig = torch.ao.quantization.get_default_qconfig("fbgemm")
 
-                self.quant = torch.quantization.QuantStub()
+                self.quant = torch.ao.quantization.QuantStub()
 
                 self.conv1 = torch.nn.Conv2d(4, 4, [2, 2], groups=1)
                 self.conv1.weight.random_(-1, 1)
@@ -173,7 +187,7 @@ class TestQuantizedConv2d(utils.TorchGlowTestCase):
                 self.conv2.weight.random_(-1, 1)
                 self.conv2.bias.data.random_(-1, 1)
 
-                self.dequant = torch.quantization.DeQuantStub()
+                self.dequant = torch.ao.quantization.DeQuantStub()
 
             def forward(self, x):
                 x = self.quant(x)
@@ -186,10 +200,10 @@ class TestQuantizedConv2d(utils.TorchGlowTestCase):
             x = torch.randn([1, 4, 4, 4])
             model = SerialQuantizedConvModel()
 
-            torch.quantization.prepare(model, inplace=True)
+            torch.ao.quantization.prepare(model, inplace=True)
             # Calibration
             model.forward(x)
-            torch.quantization.convert(model, inplace=True)
+            torch.ao.quantization.convert(model, inplace=True)
 
             utils.compare_tracing_methods(
                 model,
@@ -207,9 +221,9 @@ class TestQuantizedConv2d(utils.TorchGlowTestCase):
         class ParallelQuantizedConvModel(torch.nn.Module):
             def __init__(self):
                 super(ParallelQuantizedConvModel, self).__init__()
-                self.qconfig = torch.quantization.get_default_qconfig("fbgemm")
+                self.qconfig = torch.ao.quantization.get_default_qconfig("fbgemm")
 
-                self.quant = torch.quantization.QuantStub()
+                self.quant = torch.ao.quantization.QuantStub()
 
                 self.conv1 = torch.nn.Conv2d(4, 2, [2, 2], groups=1)
                 self.conv1.weight.random_(-1, 1)
@@ -220,8 +234,8 @@ class TestQuantizedConv2d(utils.TorchGlowTestCase):
                 self.conv2.bias.data.random_(-1, 1)
 
                 self.cat = torch.ops.quantized.cat
-                self.dequant = torch.quantization.DeQuantStub()
-                self.dequant2 = torch.quantization.DeQuantStub()
+                self.dequant = torch.ao.quantization.DeQuantStub()
+                self.dequant2 = torch.ao.quantization.DeQuantStub()
 
             def forward(self, x):
                 x = self.quant(x)
@@ -236,10 +250,10 @@ class TestQuantizedConv2d(utils.TorchGlowTestCase):
             x = torch.randn([1, 4, 4, 4])
             model = ParallelQuantizedConvModel()
 
-            torch.quantization.prepare(model, inplace=True)
+            torch.ao.quantization.prepare(model, inplace=True)
             # Calibration
             model.forward(x)
-            torch.quantization.convert(model, inplace=True)
+            torch.ao.quantization.convert(model, inplace=True)
 
             utils.compare_tracing_methods(
                 model,

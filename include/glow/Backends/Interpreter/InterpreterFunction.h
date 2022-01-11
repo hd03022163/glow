@@ -209,6 +209,9 @@ private:
   void fwdMatMulInstQuantizedImpl(const MatMulInst *I);
   template <typename ElemTy> void fwdMatMulInstFloatImpl(const MatMulInst *I);
 
+  template <typename ElemTy>
+  void fwdBatchMatMulInstFloatImpl(const BatchMatMulInst *I);
+
   template <typename ElemTy, typename AccumulatorTy,
             typename BiasElemTy = int32_t>
   void fwdFullyConnectedInstQuantizedImpl(const FullyConnectedInst *I);
@@ -407,11 +410,22 @@ private:
                             int64_t padIdx, bool sparse, bool scale,
                             dim_t embedding_dim);
 
-  template <typename ElemTy>
+  template <typename ElemTy, typename IndexTy>
   void fwdEmbeddingBagInstFloatImpl(const EmbeddingBagInst *I);
 
+  template <typename ElemTy, typename IndexTy>
+  void fwdBatchSparseToDenseInstImpl1(const BatchSparseToDenseInst *I);
+
+  template <typename ElemTy, typename LengthsTy, typename IndicesTy>
+  void fwdBatchSparseToDenseInstImpl2(const BatchSparseToDenseInst *I);
+
   template <typename ElemTy>
-  void fwdSparseToDenseInstImpl(const SparseToDenseInst *I);
+  void
+  fwdFillExamplesWithIndicatorInstImpl1(const FillExamplesWithIndicatorInst *I);
+
+  template <typename ElemTy, typename IndicatorTy>
+  void
+  fwdFillExamplesWithIndicatorInstImpl2(const FillExamplesWithIndicatorInst *I);
 
   template <class eTy>
   void fwdRescaleQuantizedInstImpl(Value *src, Value *dest,
@@ -444,7 +458,7 @@ private:
   template <typename T>
   void fwdBBoxTransformInstFloatImpl(glow::BBoxTransformInst const *I);
 
-  template <typename T, typename AccumT>
+  template <typename T, typename AccumT, typename IndexT>
   void fwdEmbeddingBagByteRowwiseOffsetsImpl(
       const EmbeddingBagByteRowwiseOffsetsInst *I);
 
@@ -459,6 +473,26 @@ private:
       const glow::BatchedPairwiseDotProductGradInst *I);
   void fwdAvgPool2DGradInst(const AvgPoolGradInst *I);
   void fwdAvgPool3DGradInst(const AvgPoolGradInst *I);
+
+  template <typename ElemTy, typename IndexTy>
+  void fwdBatchedUnaryEmbeddingsBagsInstImpl(
+      const BatchedUnaryEmbeddingsBagsInst *I);
+
+  template <typename IndexTy, typename OutputTy>
+  void
+  fwdIntNBitSplitEmbeddingBagsInstImpl(const IntNBitSplitEmbeddingBagsInst *I);
+
+  template <typename IndexTy, typename OutputTy>
+  void fwdIntNBitSplitEmbeddingWeightedBagsInstImpl(
+      const IntNBitSplitEmbeddingWeightedBagsInst *I);
+
+  template <typename IndexTy, typename OutputTy>
+  void fwdIntNBitSplitEmbeddingWeightedBagsImpl(
+      Tensor *out, Tensor *devWeights, Tensor *uvmWeights,
+      Tensor *weightsPlacements, Tensor *weightsTys, Tensor *dimOffsets,
+      Tensor *indices, Tensor *offsets, Tensor *weightsOffsets,
+      int64_t poolingMode, Tensor *indiceWeights, int64_t totalDims,
+      int64_t outputDType);
 
   ///@}
 };

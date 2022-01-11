@@ -604,12 +604,19 @@ private:
   /// \returns error on failure.
   Error loadFullLike(const torch::jit::Node *ptNode);
 
+  /// Calculate expected output type based in input tensor and optional
+  /// argument.
+  /// \returns calculated type.
+  Expected<ElemKind> getExpectedType(const torch::jit::Value *inputTensorValue,
+                                     const torch::jit::Value *dtypeValue);
+
   /// Shared implementation for loadZerosLike, loadOnesLike, loadEmptyLike,
   /// and loadFullLike. \returns error on failure.
+  template <class DType>
   Error loadFullLikeImpl(llvm::StringRef name,
                          const torch::jit::Value *inputTensorValue,
-                         const torch::jit::Value *dtypeValue,
-                         at::optional<double> fillValue,
+                         const glow::ElemKind outputGlowElemKind,
+                         at::optional<DType> fillValue,
                          const torch::jit::Value *outputValue);
 
   /// Load a PyTorch sub node.
@@ -758,6 +765,10 @@ private:
   /// Load a PyTorch quantized::add_relu node.
   /// \return error on failure.
   Error loadQuantizedAddRelu(const torch::jit::Node *ptNode);
+
+  /// Load a PyTorch quantized::leaky_relu node.
+  /// \return error on failure.
+  Error loadQuantizedLeakyRelu(const torch::jit::Node *ptNode);
 
   /// Load a PyTorch quantized::mul node.
   /// \return error on failure.
@@ -1023,6 +1034,58 @@ private:
   // Load a PyTorch fb::equally_split.
   // \returns error on failure.
   Error loadEquallySplit(const torch::jit::Node *ptNode);
+
+  /// Load PyTorch fb::expand_dims
+  /// \returns error on failure.
+  Error loadExpandDims(const torch::jit::Node *ptNode);
+
+  /// Load PyTorch aten::narrow
+  /// \returns error on failure.
+  Error loadNarrow(const torch::jit::Node *ptNode);
+
+  // Load a PyTorch aten::pixel_shuffle.
+  // \returns error on failure.
+  Error loadPixelShuffle(const torch::jit::Node *ptNode);
+
+  // Load a PyTorch aten::pixel_unshuffle.
+  // \returns error on failure.
+  Error loadPixelUnshuffle(const torch::jit::Node *ptNode);
+
+  // Load a PyTorch aten::square.
+  // \returns error on failure.
+  Error loadSquare(const torch::jit::Node *ptNode);
+
+  // Load fb::scale_gradient.
+  // \returns error on failure.
+  Error loadScaleGradient(const torch::jit::Node *ptNode);
+
+  // Load aten::erf.
+  // \returns error on failure.
+  Error loadErf(const torch::jit::Node *ptNode);
+
+  // Load fb::batched_unary_embeddings
+  // \returns error on failure.
+  Error loadBatchedUnaryEmbeddingsBags(const torch::jit::Node *ptNode);
+
+  // Load a PyTorch aten::sign.
+  // \returns error on failure.
+  Error loadSign(const torch::jit::Node *ptNode);
+
+  // Load Pytorch aten::index_add
+  // \returns error on failure.
+  Error loadIndexAdd(const torch::jit::Node *ptNode);
+
+  // Load fb:int_nbit_split_embedding_codegen_lookup_function
+  // \returns error on failure.
+  Error loadIntNBitSplitEmbeddingBags(const torch::jit::Node *ptNode);
+
+  // Load Pytorch aten::amax
+  // \returns error on failure.
+  Error loadAmax(const torch::jit::Node *ptNode);
+
+  // Load Pytorch aten::softplus
+  // \returns error on failure.
+  Error loadSoftPlus(const torch::jit::Node *ptNode);
 };
 
 } // namespace glow

@@ -344,7 +344,13 @@ void IRGenVisitor::post(Node *parent, Node *N) {
     auto *small = valueForNode(IT->getSmall());
     auto *dest = builder_.createAllocActivationInst(IT->getName(),
                                                     IT->getResult().getType());
-    builder_.createCopyInst(DECORATE_NODE_NAME(N, "copy"), dest, big);
+    if (small->getSizeInBytes() * count < big->getSizeInBytes()) {
+      builder_.createCopyInst(DECORATE_NODE_NAME(N, "copy"), dest, big);
+    } else {
+      // Small tensor completely fills the big tensor, thus no need to
+      // initialize the destination.
+      builder_.createTouchInst(DECORATE_NODE_NAME(N, "init"), dest);
+    }
     builder_.createInsertTensorInst(IT->getName(), dest, small, start, count,
                                     axis);
 
@@ -566,7 +572,7 @@ void IRGenVisitor::post(Node *parent, Node *N) {
 }
 
 void IRFunction::generateIR(const Backend &B) {
-  assert(G_->verify(&B) && "Invalid function");
+  assert(getGraph()->verify(&B) && "Invalid function");
   // Schedule the nodes.
   NodesPtrList ScheduledNodes;
   scheduleGraph(ScheduledNodes);

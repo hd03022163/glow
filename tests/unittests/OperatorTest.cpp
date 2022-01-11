@@ -184,8 +184,10 @@ static Placeholder *createPlaceholderConditionallyQuantized(
     Module &mod, ElemKind T, llvm::ArrayRef<dim_t> dims, llvm::StringRef name,
     bool isTrainable, llvm::StringRef layout = ANY_LAYOUT) {
   return isQuantizedElemKind(T)
-             ? mod.createPlaceholder(T, dims, 1.0, 0, name, isTrainable, layout)
-             : mod.createPlaceholder(T, dims, name, isTrainable, layout);
+             ? mod.createPlaceholder(T, dims, 1.0, 0, name.str(), isTrainable,
+                                     layout.str())
+             : mod.createPlaceholder(T, dims, name.str(), isTrainable,
+                                     layout.str());
 }
 
 /// Helper to get a unique Type; if \p T is quantized, then it will include a
@@ -5786,47 +5788,19 @@ TEST_P(OperatorTest, GatherDataInt8IdxInt64) {
 
 /// Helper for testing GatherND with different \p ITy / \p IndexType.
 template <typename DataType, typename IndexType>
-static void gatherNDFloatInputTest(glow::PlaceholderBindings &bindings,
-                                   glow::Module &mod, glow::Function *F,
-                                   glow::ExecutionEngine &EE, ElemKind DTy,
-                                   ElemKind ITy) {
-  /*
-    Data = [
-         [
-           [0.0,1.0],
-           [2.0,3.0]
-         ],
-         [
-           [4.0,5.0],
-           [6.0,7.0]
-         ]
-    ]
+static void gatherNDFloatTest(
+    glow::PlaceholderBindings &bindings, glow::Module &mod, glow::Function *F,
+    glow::ExecutionEngine &EE, ElemKind DTy, ElemKind ITy,
+    std::vector<dim_t> dataDims, std::vector<DataType> dataVals,
+    std::vector<dim_t> indicesDims, std::vector<IndexType> indicesVals,
+    std::vector<dim_t> outputDims, std::vector<DataType> outputVals,
+    unsigned_t batchDims) {
 
-    INDICES = [
-            [0,1],
-            [1,0]
-    ]
-
-    OUTPUT = [
-            [2.0,3.0],
-            [4.0,5.0]
-    ]
-  */
-  auto *data = mod.createPlaceholder(DTy, {2, 2, 2}, "data", false);
-  auto *indices = mod.createPlaceholder(ITy, {2, 2}, "indices", false);
-
-  bindings.allocate(data)->getHandle<DataType>() = {
-      0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f,
-  };
-  bindings.allocate(indices)->getHandle<IndexType>() = {
-      0,
-      1,
-      1,
-      0,
-  };
-
-  auto *R = F->createGatherND("gatherND", data, indices);
-
+  auto *data = mod.createPlaceholder(DTy, dataDims, "data", false);
+  auto *indices = mod.createPlaceholder(ITy, indicesDims, "indices", false);
+  bindings.allocate(data)->getHandle<DataType>() = dataVals;
+  bindings.allocate(indices)->getHandle<IndexType>() = indicesVals;
+  auto *R = F->createGatherND("gatherND", data, indices, batchDims);
   auto *result = F->createSave("save", R);
   bindings.allocate(result->getPlaceholder());
 
@@ -5834,41 +5808,125 @@ static void gatherNDFloatInputTest(glow::PlaceholderBindings &bindings,
   EE.run(bindings);
 
   Tensor *resultT = bindings.get(result->getPlaceholder());
-  Tensor expectedT(DTy, {2, 2});
-  expectedT.getHandle<DataType>() = {2.0, 3.0, 4.0, 5.0};
-
+  Tensor expectedT(DTy, outputDims);
+  expectedT.getHandle<DataType>() = outputVals;
   EXPECT_TRUE(resultT->isEqual(expectedT));
 }
 
-/// Test that Gather works with Float data and Int32 indices.
-TEST_P(OperatorTest, GatherNDDataFloatIdxInt32) {
-  CHECK_IF_ENABLED();
-  gatherNDFloatInputTest<float, int32_t>(bindings_, mod_, F_, EE_,
-                                         ElemKind::FloatTy, ElemKind::Int32ITy);
+template <typename DataType, typename IndexType>
+static void gatherNDFloatTest1(glow::PlaceholderBindings &bindings,
+                               glow::Module &mod, glow::Function *F,
+                               glow::ExecutionEngine &EE, ElemKind DTy,
+                               ElemKind ITy) {
+  // Example 1
+  // batch_dims = 0
+  // data    = [[0,1],[2,3]]   # data_shape = [2, 2]
+  // indices = [[0,0],[1,1]]   # indices_shape = [2, 2]
+  // output  = [0,3]           # output_shape = [2]
+  gatherNDFloatTest<DataType, IndexType>(bindings, mod, F, EE, DTy, ITy, {2, 2},
+                                         {0.0, 1.0, 2.0, 3.0}, {2, 2},
+                                         {0, 0, 1, 1}, {2}, {0.0, 3.0}, 0);
 }
+
+template <typename DataType, typename IndexType>
+static void gatherNDFloatTest2(glow::PlaceholderBindings &bindings,
+                               glow::Module &mod, glow::Function *F,
+                               glow::ExecutionEngine &EE, ElemKind DTy,
+                               ElemKind ITy) {
+  // Example 2
+  // batch_dims = 0
+  // data    = [[0,1],[2,3]]  # data_shape = [2, 2]
+  // indices = [[1],[0]]      # indices_shape = [2, 1]
+  // output  = [[2,3],[0,1]]  # output_shape = [2, 2]
+  gatherNDFloatTest<DataType, IndexType>(bindings, mod, F, EE, DTy, ITy, {2, 2},
+                                         {0.0, 1.0, 2.0, 3.0}, {2, 1}, {1, 0},
+                                         {2, 2}, {2.0, 3.0, 0.0, 1.0}, 0);
+}
+
+template <typename DataType, typename IndexType>
+static void gatherNDFloatTest3(glow::PlaceholderBindings &bindings,
+                               glow::Module &mod, glow::Function *F,
+                               glow::ExecutionEngine &EE, ElemKind DTy,
+                               ElemKind ITy) {
+  // Example 3
+  // batch_dims = 0
+  // data    = [[[0,1],[2,3]],[[4,5],[6,7]]] # data_shape = [2, 2, 2]
+  // indices = [[0,1],[1,0]]                 # indices_shape = [2, 2]
+  // output  = [[2,3],[4,5]]                 # output_shape = [2, 2]
+  gatherNDFloatTest<DataType, IndexType>(
+      bindings, mod, F, EE, DTy, ITy, {2, 2, 2},
+      {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0}, {2, 2}, {0, 1, 1, 0}, {2, 2},
+      {2.0, 3.0, 4.0, 5.0}, 0);
+}
+
+template <typename DataType, typename IndexType>
+static void gatherNDFloatTest4(glow::PlaceholderBindings &bindings,
+                               glow::Module &mod, glow::Function *F,
+                               glow::ExecutionEngine &EE, ElemKind DTy,
+                               ElemKind ITy) {
+  // Example 4
+  // batch_dims = 0
+  // data    = [[[0,1],[2,3]],[[4,5],[6,7]]] # data_shape = [2, 2, 2]
+  // indices = [[[0,1]],[[1,0]]]             # indices_shape = [2, 1, 2]
+  // output  = [[[2,3]],[[4,5]]]             # output_shape = [2, 1, 2]
+  gatherNDFloatTest<DataType, IndexType>(
+      bindings, mod, F, EE, DTy, ITy, {2, 2, 2},
+      {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0}, {2, 1, 2}, {0, 1, 1, 0},
+      {2, 1, 2}, {2.0, 3.0, 4.0, 5.0}, 0);
+}
+
+template <typename DataType, typename IndexType>
+static void gatherNDFloatTest5(glow::PlaceholderBindings &bindings,
+                               glow::Module &mod, glow::Function *F,
+                               glow::ExecutionEngine &EE, ElemKind DTy,
+                               ElemKind ITy) {
+  // Example 5
+  // batch_dims = 1
+  // data    = [[[0,1],[2,3]],[[4,5],[6,7]]] # data_shape = [2, 2, 2]
+  // indices = [[1],[0]]                     # indices_shape = [2, 1]
+  // output  = [[2,3],[4,5]]                 # output_shape = [2, 2]
+  gatherNDFloatTest<DataType, IndexType>(
+      bindings, mod, F, EE, DTy, ITy, {2, 2, 2},
+      {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0}, {2, 1}, {1, 0}, {2, 2},
+      {2.0, 3.0, 4.0, 5.0}, 1);
+}
+
+#define TEST_GATHER_ND(N, DATA_KIND, INDEX_KIND, DATA_TYPE, INDEX_TYPE)        \
+  TEST_P(OperatorTest, GatherND_##DATA_KIND##_##INDEX_KIND##_Test##N) {        \
+    CHECK_IF_ENABLED();                                                        \
+    gatherNDFloatTest##N<DATA_TYPE, INDEX_TYPE>(                               \
+        bindings_, mod_, F_, EE_, ElemKind::DATA_KIND, ElemKind::INDEX_KIND);  \
+  }
+
+TEST_GATHER_ND(1, FloatTy, Int32ITy, float, int32_t)
+TEST_GATHER_ND(2, FloatTy, Int32ITy, float, int32_t)
+TEST_GATHER_ND(3, FloatTy, Int32ITy, float, int32_t)
+TEST_GATHER_ND(4, FloatTy, Int32ITy, float, int32_t)
+TEST_GATHER_ND(5, FloatTy, Int32ITy, float, int32_t)
 
 #if DIM_T_BITWIDTH >= 64
-/// Test that Gather works with Float data and Int64 indices.
-TEST_P(OperatorTest, GatherNDDataFloatIdxInt64) {
-  CHECK_IF_ENABLED();
-  gatherNDFloatInputTest<float, int64_t>(bindings_, mod_, F_, EE_,
-                                         ElemKind::FloatTy, ElemKind::Int64ITy);
-}
+TEST_GATHER_ND(1, FloatTy, Int64ITy, float, int64_t)
+TEST_GATHER_ND(2, FloatTy, Int64ITy, float, int64_t)
+TEST_GATHER_ND(3, FloatTy, Int64ITy, float, int64_t)
+TEST_GATHER_ND(4, FloatTy, Int64ITy, float, int64_t)
+TEST_GATHER_ND(5, FloatTy, Int64ITy, float, int64_t)
 #endif
 
-/// Test that Gather works with Float16 data and Int32 indices.
-TEST_P(OperatorTest, GatherDataNDFloat16IdxInt32) {
-  CHECK_IF_ENABLED();
-  gatherNDFloatInputTest<float16_t, int32_t>(
-      bindings_, mod_, F_, EE_, ElemKind::Float16Ty, ElemKind::Int32ITy);
-}
+TEST_GATHER_ND(1, Float16Ty, Int32ITy, float16_t, int32_t)
+TEST_GATHER_ND(2, Float16Ty, Int32ITy, float16_t, int32_t)
+TEST_GATHER_ND(3, Float16Ty, Int32ITy, float16_t, int32_t)
+TEST_GATHER_ND(4, Float16Ty, Int32ITy, float16_t, int32_t)
+TEST_GATHER_ND(5, Float16Ty, Int32ITy, float16_t, int32_t)
 
-/// Test that Gather works with Float16 data and Int64 indices.
-TEST_P(OperatorTest, GatherNDDataFloat16IdxInt64) {
-  CHECK_IF_ENABLED();
-  gatherNDFloatInputTest<float16_t, int64_t>(
-      bindings_, mod_, F_, EE_, ElemKind::Float16Ty, ElemKind::Int64ITy);
-}
+#if DIM_T_BITWIDTH >= 64
+TEST_GATHER_ND(1, Float16Ty, Int64ITy, float16_t, int64_t)
+TEST_GATHER_ND(2, Float16Ty, Int64ITy, float16_t, int64_t)
+TEST_GATHER_ND(3, Float16Ty, Int64ITy, float16_t, int64_t)
+TEST_GATHER_ND(4, Float16Ty, Int64ITy, float16_t, int64_t)
+TEST_GATHER_ND(5, Float16Ty, Int64ITy, float16_t, int64_t)
+#endif
+
+#undef TEST_GATHER_ND
 
 /// Helper for testing GatherND with different \p ITy / \p IndexType.
 template <typename IndexType>
@@ -14016,6 +14074,53 @@ TEST_P(OperatorTest, Sigmoid_BFloat16) {
                           0.01f);
 }
 
+/// Helper to test HardSigmoid using \p DTy.
+template <typename DataType>
+static void testHardSigmoid(glow::PlaceholderBindings &bindings,
+                            glow::Module &mod, glow::Function *F,
+                            glow::ExecutionEngine &EE, ElemKind DTy,
+                            float allowedError = 0.001f) {
+  constexpr dim_t size = 5;
+  float alpha = 0.2;
+  float beta = 0.5;
+  auto *input = mod.createPlaceholder(DTy, {size}, "input", false);
+  bindings.allocate(input)->getHandle<DataType>() = {-3., -1., 0., 1., 3.};
+  auto *hardsigmoid = F->createHardSigmoid("hardsigmoid", input, alpha, beta);
+  auto *save = F->createSave("save", hardsigmoid);
+  bindings.allocate(save->getPlaceholder());
+
+  EE.compile(CompilationMode::Infer);
+  EE.run(bindings);
+
+  auto saveH = bindings.get(save->getPlaceholder())->getHandle<DataType>();
+  auto inH = bindings.get(input)->getHandle<DataType>();
+
+  for (dim_t i = 0; i < size; i++) {
+    DataType expectedResult = std::max<DataType>(
+        0,
+        std::min<DataType>(1, (DataType)alpha * inH.raw(i) + (DataType)beta));
+    EXPECT_NEAR((float)saveH.raw(i), (float)expectedResult, allowedError);
+  }
+}
+
+/// Verify that the HardSigmoid operator works correctly with FloatTy.
+TEST_P(OperatorTest, HardSigmoid_Float) {
+  CHECK_IF_ENABLED();
+  testHardSigmoid<float>(bindings_, mod_, F_, EE_, ElemKind::FloatTy);
+}
+
+/// Verify that the HardSigmoid operator works correctly with Float16Ty.
+TEST_P(OperatorTest, HardSigmoid_Float16) {
+  CHECK_IF_ENABLED();
+  testHardSigmoid<float16_t>(bindings_, mod_, F_, EE_, ElemKind::Float16Ty);
+}
+
+/// Verify that the HardSigmoid operator works correctly with BFloat16Ty.
+TEST_P(OperatorTest, HardSigmoid_BFloat16) {
+  CHECK_IF_ENABLED();
+  testHardSigmoid<bfloat16_t>(bindings_, mod_, F_, EE_, ElemKind::BFloat16Ty);
+}
+
 /// Helper to test Swish using \p DTy.
 template <typename DataType>
 static void testSwish(glow::PlaceholderBindings &bindings, glow::Module &mod,
@@ -15093,7 +15198,7 @@ TEST_P(OperatorTest, CumSum3D_bfloat16_t_Dim2) {
 }
 
 TEST_P(OperatorTest, CumSum2D_int32_t_Dim0) {
-  // Data: {1..24} arranged in 2 x 3 x 4
+  // Data: {1..12} arranged in 3 x 4
   // Answer sums ALONG the axis specified
   CHECK_IF_ENABLED();
   Tensor *dimSums =
@@ -15109,7 +15214,7 @@ TEST_P(OperatorTest, CumSum2D_int32_t_Dim0) {
 }
 
 TEST_P(OperatorTest, CumSum2D_int32_t_Dim1) {
-  // Data: {1..24} arranged in 2 x 3 x 4
+  // Data: {1..12} arranged in 3 x 4
   // Answer sums ALONG the axis specified
   CHECK_IF_ENABLED();
   Tensor *dimSums =
@@ -16422,9 +16527,6 @@ static void testRepeatedSLSWithPartialTensors(
     glow::PlaceholderBindings &bindings, glow::Module &mod, glow::Function *F,
     glow::ExecutionEngine &EE, std::vector<Tensor> &unownedTensors,
     llvm::StringRef backendName, ElemKind ITy) {
-  // Turn on input sanitization
-  glow::runtime::flags::SanitizeInputsPercent = 100;
-
   // This test is only meaningful if the backend supports partial tensors.
   ASSERT_TRUE(EE.getBackend(backendName).supportsPartialTensors());
 
@@ -17402,6 +17504,16 @@ TEST_P(OperatorTest,
                                /* useFP16Accumulation */ true);
 }
 
+/// Test Fused-RWQ-SLWS in Float16 wth 4-bit quantization for the embedding.
+/// Uses Float accumulation, Float for scale/offset.
+TEST_P(OperatorTest,
+       FusedRowwiseQuantizedSLWSTwoColumn_Fused4Bit_Float_AccumFloat) {
+  ENABLED_BACKENDS("Interpreter");
+  testSLWSTwoColumn<float>(bindings_, mod_, F_, EE_, ElemKind::UInt4FusedQTy,
+                           0.1,
+                           /* useFP16Accumulation */ false);
+}
+
 /// Helper to test SLWS with different lengths modes, with precision \p DTy,
 /// and precision for data \p dataDTy.
 template <typename DataType>
@@ -17708,33 +17820,30 @@ TEST_P(OperatorStatelessTest, SLSAllZeroLengths_Float16) {
                             ElemKind::Float16Ty, ElemKind::Float16Ty);
 }
 
-template <typename DataType, typename IndexType>
-static void testSparseToDense(glow::PlaceholderBindings &bindings,
-                              glow::Module &mod, glow::Function *F,
-                              glow::ExecutionEngine &EE, ElemKind DTy,
-                              ElemKind ITy) {
+template <typename DataType, typename LengthType, typename IndexType>
+static void testBatchSparseToDense(glow::PlaceholderBindings &bindings,
+                                   glow::Module &mod, glow::Function *F,
+                                   glow::ExecutionEngine &EE, ElemKind DTy,
+                                   ElemKind LTy, ElemKind ITy) {
+  constexpr dim_t numBatches = 6;
+  constexpr dim_t numIndices = 10;
 
-  // Create and initialize inputs. Make input 3D to make sure
-  // multidimensional values are handled properly.
-  constexpr dim_t kNumIndices = 4;
-  constexpr dim_t kRows = 10;
-  constexpr dim_t kCols = 5;
-  constexpr dim_t kMaxIndex = 10;
+  auto *lengths = mod.createPlaceholder(LTy, {numBatches}, "lengths", false);
+  auto *indices = mod.createPlaceholder(ITy, {numIndices}, "indices", false);
+  auto *values = mod.createPlaceholder(DTy, {numIndices}, "values", false);
+  float defaultValue = 0.5;
+  unsigned_t denseLastDim = 10;
 
-  auto *indices = mod.createPlaceholder(ITy, {kNumIndices}, "indices", false);
-  auto *values =
-      mod.createPlaceholder(DTy, {kNumIndices, kRows, kCols}, "data", false);
-  auto *dataToInferDim = mod.createPlaceholder(ElemKind::FloatTy, {kMaxIndex},
-                                               "dataToInferDim", false);
-
+  auto LH = bindings.allocate(lengths)->getHandle<LengthType>();
   auto IH = bindings.allocate(indices)->getHandle<IndexType>();
   auto VH = bindings.allocate(values)->getHandle<DataType>();
 
-  // Duplicate one index to test that the corresponding values are added.
-  IH = {1, 3, 1, 9};
+  LH = {1, 0, 3, 4, 0, 2};
+  IH = {0, 1, 2, 1, 3, 6, 4, 5, 2, 8};
 
-  auto *STDN = F->createSparseToDense("STDN", indices, values, dataToInferDim);
-  auto *S = F->createSave("save", STDN);
+  auto *BSTD = F->createBatchSparseToDense("BSTD", lengths, indices, values,
+                                           defaultValue, denseLastDim);
+  auto *S = F->createSave("save", BSTD);
   bindings.allocate(S->getPlaceholder());
 
   EE.compile(CompilationMode::Infer);
@@ -17745,62 +17854,121 @@ static void testSparseToDense(glow::PlaceholderBindings &bindings,
   Tensor &result = *bindings.get(S->getPlaceholder());
 
   // Compute expected output.
-  Tensor expected(DTy, {kMaxIndex, kRows, kCols});
+  Tensor expected(DTy, {numBatches, denseLastDim});
   auto EH = expected.getHandle<DataType>();
-
-  Tensor expectedFP32(ElemKind::FloatTy, {kMaxIndex, kRows, kCols});
-  auto EHFP32 = expectedFP32.getHandle<float>();
-  expectedFP32.zero();
-
-  expected.zero();
-  for (dim_t i = 0; i < kNumIndices; ++i) {
-    dim_t idx = IH.at({i});
-    for (dim_t j = 0; j < kRows; ++j) {
-      for (dim_t k = 0; k < kCols; ++k) {
-        if (std::is_same<DataType, float16_t>::value) {
-          EHFP32.at({idx, j, k}) += (float)VH.at({i, j, k});
-        } else {
-          EH.at({idx, j, k}) += VH.at({i, j, k});
-        }
-      }
-    }
-  }
-
-  if (std::is_same<DataType, float16_t>::value) {
-    for (dim_t i = 0; i < kMaxIndex; ++i) {
-      for (dim_t j = 0; j < kRows; ++j) {
-        for (dim_t k = 0; k < kCols; ++k) {
-          EH.at({i, j, k}) = (float16_t)EHFP32.at({i, j, k});
-        }
-      }
+  EH.clear(defaultValue);
+  auto curInd = 0;
+  for (dim_t i = 0; i < numBatches; ++i) {
+    auto batchNumIndices = LH.at({i});
+    for (dim_t j = 0; j < batchNumIndices; ++j) {
+      EH.at({i, static_cast<dim_t>(IH.at(curInd))}) = VH.at(curInd);
+      curInd++;
     }
   }
 
   EXPECT_TRUE(expected.isEqual(result));
 }
 
-TEST_P(OperatorTest, SparseToDense_Float) {
+TEST_P(OperatorTest, BatchSparseToDense_Float) {
   CHECK_IF_ENABLED();
-  testSparseToDense<float, int64_t>(bindings_, mod_, F_, EE_, ElemKind::FloatTy,
-                                    ElemKind::Int64ITy);
+  testBatchSparseToDense<float, int64_t, int64_t>(
+      bindings_, mod_, F_, EE_, ElemKind::FloatTy, ElemKind::Int64ITy,
+      ElemKind::Int64ITy);
 }
 
-TEST_P(OperatorTest, SparseToDense_Float_Int32) {
+TEST_P(OperatorTest, BatchSparseToDense_Float_Int32_Int32) {
   CHECK_IF_ENABLED();
-  testSparseToDense<float, int32_t>(bindings_, mod_, F_, EE_, ElemKind::FloatTy,
-                                    ElemKind::Int32ITy);
+  testBatchSparseToDense<float, int32_t, int32_t>(
+      bindings_, mod_, F_, EE_, ElemKind::FloatTy, ElemKind::Int32ITy,
+      ElemKind::Int32ITy);
 }
 
-TEST_P(OperatorTest, SparseToDense_Float16_Int32) {
+TEST_P(OperatorTest, BatchSparseToDense_Float16) {
   CHECK_IF_ENABLED();
-  testSparseToDense<float16_t, int32_t>(
+  testBatchSparseToDense<float16_t, int64_t, int64_t>(
+      bindings_, mod_, F_, EE_, ElemKind::Float16Ty, ElemKind::Int64ITy,
+      ElemKind::Int64ITy);
+}
+
+TEST_P(OperatorTest, BatchSparseToDense_BFloat16) {
+  CHECK_IF_ENABLED();
+  testBatchSparseToDense<bfloat16_t, int64_t, int64_t>(
+      bindings_, mod_, F_, EE_, ElemKind::BFloat16Ty, ElemKind::Int64ITy,
+      ElemKind::Int64ITy);
+}
+
+template <typename DataType, typename IndicatorType>
+static void testFillExamplesWithIndicator(glow::PlaceholderBindings &bindings,
+                                          glow::Module &mod, glow::Function *F,
+                                          glow::ExecutionEngine &EE,
+                                          ElemKind DTy, ElemKind IndTy) {
+  // Create and initialize inputs. Make input 3D to make sure
+  // multidimensional values are handled properly.
+  auto *indicator = mod.createPlaceholder(IndTy, {8}, "indicator", false);
+  auto *data = mod.createPlaceholder(DTy, {4, 3, 2}, "data", false);
+
+  auto IH = bindings.allocate(indicator)->getHandle<IndicatorType>();
+  auto DH = bindings.allocate(data)->getHandle<DataType>();
+
+  IH = {1, 0, 1, 0, 1, 1, 0, 0};
+
+  auto *filled = F->createFillExamplesWithIndicator("filled", data, indicator);
+  auto *S = F->createSave("save", filled);
+  bindings.allocate(S->getPlaceholder());
+
+  EE.compile(CompilationMode::Infer);
+
+  DH.randomize(-3.0, 3.0, mod.getPRNG());
+  EE.run(bindings);
+
+  Tensor &result = *bindings.get(S->getPlaceholder());
+
+  // Compute expected output.
+  Tensor expected(DTy, {8, 3, 2});
+  expected.zero();
+  auto EH = expected.getHandle<DataType>();
+  dim_t idx = 0;
+  for (dim_t i = 0; i < 8; ++i) {
+    if (IH.at(i) == 1) {
+      for (dim_t j = 0; j < 3; ++j) {
+        for (dim_t k = 0; k < 2; ++k) {
+          EH.at({i, j, k}) = DH.at({idx, j, k});
+        }
+      }
+      idx++;
+    }
+  }
+  EXPECT_TRUE(expected.isEqual(result));
+}
+
+TEST_P(OperatorTest, FillExamplesWithIndicator_Float_Int64) {
+  CHECK_IF_ENABLED();
+  testFillExamplesWithIndicator<float, int64_t>(
+      bindings_, mod_, F_, EE_, ElemKind::FloatTy, ElemKind::Int64ITy);
+}
+
+TEST_P(OperatorTest, FillExamplesWithIndicator_Float16_Int32) {
+  CHECK_IF_ENABLED();
+  testFillExamplesWithIndicator<float16_t, int32_t>(
       bindings_, mod_, F_, EE_, ElemKind::Float16Ty, ElemKind::Int32ITy);
 }
 
-TEST_P(OperatorTest, SparseToDense_Int64) {
+TEST_P(OperatorTest, FillExamplesWithIndicator_Float16_Bool) {
   CHECK_IF_ENABLED();
-  testSparseToDense<int64_t, int64_t>(bindings_, mod_, F_, EE_,
-                                      ElemKind::Int64ITy, ElemKind::Int64ITy);
+  testFillExamplesWithIndicator<float16_t, bool>(
+      bindings_, mod_, F_, EE_, ElemKind::Float16Ty, ElemKind::BoolTy);
+}
+
+TEST_P(OperatorTest, FillExamplesWithIndicator_BFloat16_Int32) {
+  CHECK_IF_ENABLED();
+  testFillExamplesWithIndicator<bfloat16_t, int32_t>(
+      bindings_, mod_, F_, EE_, ElemKind::BFloat16Ty, ElemKind::Int32ITy);
+}
+
+TEST_P(OperatorTest, FillExamplesWithIndicator_Int32_Int32) {
+  CHECK_IF_ENABLED();
+  testFillExamplesWithIndicator<int32_t, int32_t>(
+      bindings_, mod_, F_, EE_, ElemKind::Int32ITy, ElemKind::Int32ITy);
 }
 
 TEST_P(OperatorTest, SparseToDenseMask1) {
@@ -20720,6 +20888,48 @@ TEST_P(OperatorTest, RMSNorm) {
   }
 }
 
+TEST_P(OperatorTest, InstanceNormalization_FloatTy) {
+  CHECK_IF_ENABLED();
+  auto *inp =
+      mod_.createPlaceholder(ElemKind::FloatTy, {2, 3, 2, 2}, "inp", false);
+  // Initiliaze inp
+  auto inpH = bindings_.allocate(inp)->getHandle<float>();
+  inpH = {0.0,  1.0,  2.0,  3.0,  4.0,  5.0,  6.0,  7.0,
+          8.0,  9.0,  10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+          16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0};
+  // Setting scale and bias
+  auto *scale = mod_.createConstant(ElemKind::FloatTy, {3}, "scale");
+  scale->getHandle() = {1.0, 1.5, 2.0};
+  auto *bias = mod_.createConstant(ElemKind::FloatTy, {3}, "bias");
+  bias->getHandle() = {0.0, 1.0, 2.0};
+
+  auto *node =
+      F_->createInstanceNormalization("instNorm", inp, bias, scale, 1, 1e-5);
+  auto *save = F_->createSave("save", node);
+  auto *outT = bindings_.allocate(save->getPlaceholder());
+  EE_.compile(CompilationMode::Infer);
+  EE_.run(bindings_);
+  auto outH = outT->getHandle<float>();
+  std::vector<float> mergedScale = {0.89442361, 1.34163542, 1.78884723,
+                                    0.89442361, 1.34163542, 1.78884723};
+  std::vector<float> mergedBias = {-1.34163542,  -6.37899481,  -14.99404865,
+                                   -12.07471878, -22.47861985, -36.46021537};
+
+  EXPECT_EQ(outH.size(), 24);
+  for (dim_t i = 0; i < 2; i++) {
+    for (dim_t j = 0; j < 3; j++) {
+      for (dim_t k = 0; k < 2; k++) {
+        for (dim_t l = 0; l < 2; l++) {
+          EXPECT_NEAR(outH.at({i, j, k, l}),
+                      inpH.at({i, j, k, l}) * mergedScale.at(i * 3 + j) +
+                          mergedBias.at(i * 3 + j),
+                      1e-5);
+        }
+      }
+    }
+  }
+}
+
 TEST_P(OperatorTest, SparseLabelSplit) {
   CHECK_IF_ENABLED();
 
@@ -20780,6 +20990,788 @@ TEST_P(OperatorTest, SparseLabelSplit) {
     EXPECT_EQ(expectedGradientOffsetMap[d],
               gradientOffsetMapT->getHandle<int32_t>().at(d));
   }
+}
+
+/// Test BatchedUnaryEmbeddingsBags
+template <typename DataTy>
+static void testBatchedUnaryEmbeddingsBags(glow::PlaceholderBindings &bindings,
+                                           glow::Module &mod, glow::Function *F,
+                                           glow::ExecutionEngine &EE,
+                                           ElemKind DTy, float allowedError) {
+  ShapeVector idims = {1, 38, 1};
+  ShapeVector odims = {1, 1, 3};
+
+  Tensor weightsTensorReal(DTy, idims);
+  Tensor indicesTensorReal(ElemKind::Int32ITy, {9});
+  Tensor offsetsTensorReal(ElemKind::Int32ITy, {4});
+  Tensor tableOffsetsTensorReal(ElemKind::Int32ITy, {4});
+
+  weightsTensorReal.getHandle<DataTy>() = {
+      0.4705, 0.0634, 0.8867, 0.3685, 0.0328, 0.1191, 0.1907, 0.9518,
+      0.3688, 0.5838, 0.0315, 0.3067, 0.0160, 0.3304, 0.2706, 0.4694,
+      0.0182, 0.9961, 0.5213, 0.4605, 0.6342, 0.5052, 0.9236, 0.2747,
+      0.3745, 0.9434, 0.5810, 0.5646, 0.5182, 0.9379, 0.0866, 0.0854,
+      0.1088, 0.4771, 0.0636, 0.5778, 0.5571, 0.3586};
+  indicesTensorReal.getHandle<int32_t>() = {1, 1, 3, 13, 14, 4, 15, 11, 16};
+  offsetsTensorReal.getHandle<int32_t>() = {0, 3, 5, 9};
+  tableOffsetsTensorReal.getHandle<int32_t>() = {0, 4, 21, 38};
+
+  auto weights = mod.createPlaceholder(DTy, idims, "weights", false);
+  auto indices =
+      mod.createPlaceholder(ElemKind::Int32ITy, {9}, "indices", false);
+  auto offsets =
+      mod.createPlaceholder(ElemKind::Int32ITy, {4}, "offsets", false);
+  auto tableOffsets =
+      mod.createPlaceholder(ElemKind::Int32ITy, {4}, "tableOffsets", false);
+
+  bindings.insert(weights, std::move(weightsTensorReal));
+  bindings.insert(indices, std::move(indicesTensorReal));
+  bindings.insert(offsets, std::move(offsetsTensorReal));
+  bindings.insert(tableOffsets, std::move(tableOffsetsTensorReal));
+
+  auto *R = F->createBatchedUnaryEmbeddingsBags(
+      "BatchedUnaryEmbeddingsBags", weights, tableOffsets, indices, offsets);
+  auto *S = F->createSave("save", R);
+  bindings.allocate(S->getPlaceholder());
+
+  EE.compile(CompilationMode::Infer);
+  EE.run(bindings);
+
+  Tensor &result = *bindings.get(S->getPlaceholder());
+  Tensor expected(DTy, odims);
+  expected.getHandle<DataTy>() = {
+      0.4953,
+      1.5174,
+      1.9679,
+  };
+
+  EXPECT_TRUE(expected.isEqual(result, allowedError));
+}
+
+/// Test that BatchedUnaryEmbeddingsBags is correctly supported in FloatTy.
+TEST_P(OperatorTest, BatchedUnaryEmbeddingsBags_Float) {
+  CHECK_IF_ENABLED();
+  testBatchedUnaryEmbeddingsBags<float>(bindings_, mod_, F_, EE_,
+                                        ElemKind::FloatTy, 0.0001);
+}
+
+/// Test that BatchedUnaryEmbeddingsBags is correctly supported in Float16Ty.
+TEST_P(OperatorTest, BatchedUnaryEmbeddingsBags_Float16) {
+  CHECK_IF_ENABLED();
+  testBatchedUnaryEmbeddingsBags<float16_t>(bindings_, mod_, F_, EE_,
+                                            ElemKind::Float16Ty, 0.005);
+}
+
+template <typename WeightTy, typename IndexTy, typename OutputTy>
+static void testIntNBitSplitEmbeddingBagsSingle(
+    glow::PlaceholderBindings &bindings, glow::Module &mod, glow::Function *F,
+    glow::ExecutionEngine &EE, SplitEmbeddingSparseType DTy, ElemKind IdxTy,
+    Tensor expected, SplitEmbeddingPoolingMode poolingMode,
+    SplitEmbeddingSparseType outputDType, float allowedError) {
+  Tensor devWeightsTensorReal(ElemKind::UInt8ITy, {128});
+  Tensor indicesTensorReal(IdxTy, {10});
+  Tensor offsetsTensorReal(IdxTy, {3});
+  Tensor dimOffsetsTensorReal(ElemKind::Int32ITy, {2});
+  Tensor weightsPlacementReal(ElemKind::Int32ITy, {1});
+  Tensor weightsTysTensorReal(ElemKind::UInt8ITy, {1});
+
+  // single float 1.724026083946228 with padding zeros
+  // half float -0.07635 with padding bytes and zeros
+  // int8 1.965 with padding bytes and zeros
+  // int4 1.965 with padding bytes and zeros
+  devWeightsTensorReal.getHandle<uint8_t>() = {
+      227, 172, 220, 63, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0,   0,   0,   0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0,   0,   0,   0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0,   0,   0,   0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0,   0,   0,   0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0,   0,   0,   0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  };
+  Tensor uvmWeightsTensorReal = devWeightsTensorReal.clone();
+  indicesTensorReal.getHandle<IndexTy>() = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  Tensor weightsOffsetsReal(ElemKind::Int32ITy, {1});
+  weightsOffsetsReal.getHandle<int32_t>() = {0};
+  offsetsTensorReal.getHandle<IndexTy>() = {0, 4, 10};
+  dimOffsetsTensorReal.getHandle<int32_t>() = {0, 1};
+  weightsPlacementReal.getHandle<int32_t>() = {3};
+  weightsTysTensorReal.getHandle<uint8_t>() = {static_cast<uint8_t>(DTy)};
+
+  auto devWeights = mod.createPlaceholder(ElemKind::UInt8ITy,
+                                          devWeightsTensorReal.getSizeInBytes(),
+                                          "devWeights", false);
+  auto indices = mod.createPlaceholder(IdxTy, {10}, "indices", false);
+  auto offsets = mod.createPlaceholder(IdxTy, {3}, "offsets", false);
+  auto weightsOffsets =
+      mod.createPlaceholder(ElemKind::Int32ITy, {1}, "weightsOffsets", false);
+  auto dimOffsets =
+      mod.createPlaceholder(ElemKind::Int32ITy, {2}, "dimOffsets", false);
+  auto uvmWeights = mod.createPlaceholder(ElemKind::UInt8ITy,
+                                          uvmWeightsTensorReal.getSizeInBytes(),
+                                          "uvmWeights", false);
+  auto weightsPlacement =
+      mod.createPlaceholder(ElemKind::Int32ITy, {1}, "weightsPlacement", false);
+  auto weightsTys =
+      mod.createPlaceholder(ElemKind::UInt8ITy, {1}, "weightsTys", false);
+  auto indiceWeights = NodeValue();
+
+  bindings.insert(devWeights, std::move(devWeightsTensorReal));
+  bindings.insert(uvmWeights, std::move(uvmWeightsTensorReal));
+  bindings.insert(indices, std::move(indicesTensorReal));
+  bindings.insert(offsets, std::move(offsetsTensorReal));
+  bindings.insert(weightsOffsets, std::move(weightsOffsetsReal));
+  bindings.insert(dimOffsets, std::move(dimOffsetsTensorReal));
+  bindings.insert(weightsPlacement, std::move(weightsPlacementReal));
+  bindings.insert(weightsTys, std::move(weightsTysTensorReal));
+
+  auto *R = F->createIntNBitSplitEmbeddingBags(
+      "IntNBitSplitEmbeddingBags", devWeights, uvmWeights, weightsPlacement,
+      weightsOffsets, weightsTys, dimOffsets, 1, indices, offsets, poolingMode,
+      outputDType);
+  auto *S = F->createSave("save", R);
+  bindings.allocate(S->getPlaceholder());
+
+  EE.compile(CompilationMode::Infer);
+  EE.run(bindings);
+
+  Tensor &result = *bindings.get(S->getPlaceholder());
+
+  EXPECT_TRUE(expected.isEqual(result, allowedError));
+}
+
+/// Test IntNBitSplitEmbeddingBags
+template <typename WeightTy, typename IndexTy, typename OutputTy>
+static void testIntNBitSplitEmbeddingBags(
+    glow::PlaceholderBindings &bindings, glow::Module &mod, glow::Function *F,
+    glow::ExecutionEngine &EE, ElemKind DTy, ElemKind IdxTy, Tensor Weights,
+    Tensor WeightsOffsets, Tensor expected,
+    SplitEmbeddingPoolingMode poolingMode, SplitEmbeddingSparseType outputDType,
+    float allowedError) {
+  Tensor devWeightsTensorReal = Weights.clone();
+  Tensor uvmWeightsTensorReal = Weights.clone();
+  Tensor indicesTensorReal(IdxTy, {157});
+  Tensor offsetsTensorReal(IdxTy, {9});
+  Tensor weightsOffsetsTensorReal = std::move(WeightsOffsets);
+  Tensor dimOffsetsTensorReal(ElemKind::Int32ITy, {5});
+  Tensor weightsPlacementReal(ElemKind::Int32ITy, {4});
+  Tensor weightsTysTensorReal(ElemKind::UInt8ITy, {4});
+
+  indicesTensorReal.getHandle<IndexTy>() = {
+      5, 3, 6, 0, 0, 5, 6, 6, 5, 7, 1, 1, 7, 6, 3,  1, 4,  1,  3, 3, 6,  1, 1,
+      6, 7, 2, 5, 4, 6, 7, 1, 4, 1, 4, 4, 5, 4, 2,  3, 6,  4,  0, 4, 2,  6, 7,
+      5, 0, 1, 3, 1, 2, 1, 5, 9, 3, 8, 4, 1, 4, 10, 4, 1,  1,  1, 7, 4,  7, 2,
+      2, 4, 3, 4, 9, 8, 8, 5, 5, 5, 2, 6, 7, 4, 7,  6, 6,  10, 0, 3, 10, 5, 4,
+      3, 3, 3, 4, 4, 9, 9, 7, 2, 1, 7, 4, 2, 9, 6,  6, 10, 5,  1, 0, 6,  3, 6,
+      2, 9, 3, 9, 3, 1, 3, 2, 3, 1, 3, 7, 2, 3, 3,  8, 7,  4,  7, 8, 9,  2, 3,
+      3, 4, 4, 8, 3, 4, 1, 9, 2, 1, 9, 2, 6, 8, 3,  3, 4,  2,  9,
+  };
+  offsetsTensorReal.getHandle<IndexTy>() = {0, 0, 1, 2, 3, 51, 92, 123, 157};
+  dimOffsetsTensorReal.getHandle<int32_t>() = {0, 8, 16, 20, 26};
+  weightsPlacementReal.getHandle<int32_t>() = {3, 1, 2, 3};
+  if (std::is_same<WeightTy, float>::value) {
+    weightsTysTensorReal.getHandle<uint8_t>() = {0, 0, 0, 0};
+  } else {
+    weightsTysTensorReal.getHandle<uint8_t>() = {1, 1, 1, 1};
+  }
+
+  auto devWeights = mod.createPlaceholder(ElemKind::UInt8ITy,
+                                          devWeightsTensorReal.getSizeInBytes(),
+                                          "devWeights", false);
+  auto indices = mod.createPlaceholder(IdxTy, {157}, "indices", false);
+  auto offsets = mod.createPlaceholder(IdxTy, {9}, "offsets", false);
+  auto weightsOffsets =
+      mod.createPlaceholder(ElemKind::Int32ITy, {4}, "weightsOffsets", false);
+  auto dimOffsets =
+      mod.createPlaceholder(ElemKind::Int32ITy, {5}, "dimOffsets", false);
+  auto uvmWeights = mod.createPlaceholder(ElemKind::UInt8ITy,
+                                          uvmWeightsTensorReal.getSizeInBytes(),
+                                          "uvmWeights", false);
+  auto weightsPlacement =
+      mod.createPlaceholder(ElemKind::Int32ITy, {4}, "weightsPlacement", false);
+  auto weightsTys =
+      mod.createPlaceholder(ElemKind::UInt8ITy, {4}, "weightsTys", false);
+  auto indiceWeights = NodeValue();
+
+  bindings.insert(devWeights, std::move(devWeightsTensorReal));
+  bindings.insert(uvmWeights, std::move(uvmWeightsTensorReal));
+  bindings.insert(indices, std::move(indicesTensorReal));
+  bindings.insert(offsets, std::move(offsetsTensorReal));
+  bindings.insert(weightsOffsets, std::move(weightsOffsetsTensorReal));
+  bindings.insert(dimOffsets, std::move(dimOffsetsTensorReal));
+  bindings.insert(weightsPlacement, std::move(weightsPlacementReal));
+  bindings.insert(weightsTys, std::move(weightsTysTensorReal));
+
+  auto *R = F->createIntNBitSplitEmbeddingBags(
+      "IntNBitSplitEmbeddingBags", devWeights, uvmWeights, weightsPlacement,
+      weightsOffsets, weightsTys, dimOffsets, 26, indices, offsets, poolingMode,
+      outputDType);
+  auto *S = F->createSave("save", R);
+  bindings.allocate(S->getPlaceholder());
+
+  EE.compile(CompilationMode::Infer);
+  EE.run(bindings);
+
+  Tensor &result = *bindings.get(S->getPlaceholder());
+
+  EXPECT_TRUE(expected.isEqual(result, allowedError));
+}
+
+static Tensor getIntNBitSplitEmbeddingBagsWeightsFloat() {
+  Tensor weights(ElemKind::UInt8ITy, 1024);
+  weights.getHandle<uint8_t>() = {
+      122, 49,  217, 65,  98,  154, 111, 224, 171, 33,  179, 80,  219, 246, 62,
+      36,  94,  80,  108, 33,  71,  149, 148, 130, 238, 154, 108, 236, 242, 144,
+      72,  152, 103, 0,   226, 107, 40,  232, 196, 50,  21,  205, 140, 139, 178,
+      100, 44,  74,  10,  116, 203, 228, 153, 102, 220, 160, 184, 187, 168, 201,
+      145, 43,  139, 36,  184, 195, 212, 245, 196, 128, 133, 219, 5,   211, 31,
+      144, 211, 63,  5,   104, 169, 237, 245, 52,  171, 136, 32,  191, 101, 174,
+      162, 10,  84,  4,   92,  183, 28,  171, 23,  65,  115, 28,  209, 250, 32,
+      31,  104, 0,   48,  37,  148, 163, 208, 94,  16,  182, 39,  225, 204, 211,
+      78,  234, 148, 37,  52,  140, 131, 85,  209, 45,  203, 183, 55,  201, 20,
+      75,  103, 132, 101, 2,   121, 82,  251, 110, 4,   3,   62,  237, 27,  106,
+      46,  86,  230, 49,  76,  85,  117, 18,  244, 176, 183, 8,   102, 32,  97,
+      138, 52,  64,  79,  73,  2,   159, 245, 48,  145, 72,  7,   180, 120, 108,
+      58,  114, 145, 150, 1,   81,  182, 133, 197, 75,  80,  34,  70,  30,  33,
+      44,  124, 227, 177, 0,   27,  52,  117, 73,  37,  103, 194, 179, 134, 188,
+      156, 10,  12,  167, 86,  103, 89,  224, 128, 87,  110, 183, 23,  208, 249,
+      224, 4,   63,  85,  135, 242, 206, 46,  68,  9,   127, 71,  24,  17,  181,
+      39,  156, 171, 92,  92,  131, 244, 95,  233, 226, 183, 22,  71,  38,  66,
+      93,  45,  85,  241, 9,   240, 48,  12,  41,  252, 190, 202, 191, 248, 170,
+      174, 157, 73,  67,  5,   247, 56,  21,  224, 150, 47,  65,  125, 143, 21,
+      194, 194, 142, 211, 36,  29,  196, 110, 77,  179, 235, 173, 237, 152, 18,
+      254, 2,   120, 254, 192, 18,  251, 113, 139, 105, 69,  83,  25,  230, 65,
+      116, 107, 107, 230, 105, 245, 133, 28,  88,  97,  47,  209, 6,   101, 157,
+      198, 153, 108, 197, 116, 183, 139, 32,  115, 237, 229, 146, 13,  30,  205,
+      234, 66,  108, 52,  83,  91,  81,  240, 4,   21,  131, 224, 142, 250, 6,
+      150, 159, 36,  220, 130, 178, 133, 187, 19,  221, 187, 198, 63,  236, 67,
+      166, 248, 151, 204, 148, 228, 176, 181, 128, 174, 118, 186, 214, 220, 199,
+      56,  160, 90,  173, 236, 124, 41,  109, 98,  231, 83,  160, 1,   92,  210,
+      110, 102, 68,  198, 84,  56,  187, 20,  68,  58,  147, 0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   108, 52,  136, 212, 17,  233, 188, 145, 127, 218, 92,  119, 131,
+      107, 11,  179, 73,  94,  231, 175, 54,  178, 116, 127, 212, 38,  175, 196,
+      145, 207, 204, 68,  135, 229, 94,  16,  167, 20,  189, 61,  252, 21,  21,
+      196, 245, 72,  230, 14,  94,  146, 3,   37,  213, 199, 19,  8,   244, 122,
+      174, 185, 2,   11,  42,  23,  7,   177, 185, 222, 90,  44,  220, 41,  53,
+      135, 46,  227, 41,  85,  183, 166, 250, 156, 10,  50,  100, 103, 120, 95,
+      105, 10,  6,   222, 233, 76,  147, 254, 251, 139, 36,  23,  71,  169, 228,
+      161, 174, 244, 71,  85,  118, 163, 126, 152, 9,   224, 98,  49,  66,  146,
+      77,  186, 218, 130, 112, 48,  20,  211, 141, 175, 145, 254, 217, 102, 22,
+      184, 213, 179, 204, 206, 151, 29,  209, 125, 236, 142, 217, 157, 243, 162,
+      163, 95,  227, 223, 0,   0,   0,   0,   0,   0,   0,   0,   187, 236, 246,
+      127, 92,  248, 2,   247, 7,   41,  108, 161, 66,  133, 134, 159, 55,  85,
+      161, 73,  108, 95,  106, 145, 0,   0,   0,   0,   0,   0,   0,   0,   221,
+      149, 198, 30,  206, 45,  150, 80,  172, 118, 29,  250, 196, 93,  39,  252,
+      118, 112, 62,  169, 170, 59,  99,  106, 0,   0,   0,   0,   0,   0,   0,
+      0,   238, 12,  93,  71,  43,  47,  86,  230, 138, 103, 125, 129, 129, 251,
+      207, 26,  249, 232, 50,  168, 156, 63,  238, 159, 0,   0,   0,   0,   0,
+      0,   0,   0,   68,  74,  234, 112, 127, 94,  155, 155, 178, 19,  153, 186,
+      137, 218, 13,  57,  243, 106, 99,  219, 153, 218, 174, 21,  0,   0,   0,
+      0,   0,   0,   0,   0,   12,  125, 32,  194, 118, 244, 208, 234, 21,  220,
+      101, 34,  150, 182, 102, 196, 161, 155, 235, 148, 120, 153, 161, 239, 0,
+      0,   0,   0,   0,   0,   0,   0,   175, 148, 182, 141, 251, 25,  127, 0,
+      33,  67,  236, 173, 100, 89,  67,  195, 11,  151, 96,  143, 136, 34,  61,
+      196, 0,   0,   0,   0,   0,   0,   0,   0,   193, 251, 231, 23,  174, 240,
+      116, 161, 6,   46,  49,  198, 175, 197, 131, 1,   233, 160, 33,  78,  254,
+      215, 103, 171, 0,   0,   0,   0,   0,   0,   0,   0,   6,   251, 197, 145,
+      64,  128, 52,  72,  55,  60,  21,  242, 33,  12,  252, 133, 165, 15,  65,
+      93,  237, 166, 204, 87,  0,   0,   0,   0,   0,   0,   0,   0,   202, 13,
+      100, 124, 139, 43,  180, 40,  165, 244, 228, 109, 9,   226, 55,  154, 88,
+      4,   122, 102, 185, 113, 165, 39,  0,   0,   0,   0,   0,   0,   0,   0,
+      212, 2,   67,  190, 101, 23,  80,  96,  123, 7,   43,  179, 114, 167, 149,
+      199, 5,   204, 192, 145, 236, 246, 143, 98,  0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,
+  };
+  return weights;
+}
+
+static Tensor getIntNBitSplitEmbeddingBagsWeightsFloat16() {
+  Tensor weights(ElemKind::UInt8ITy, 768);
+  weights.getHandle<uint8_t>() = {
+      194, 31,  91,  184, 11,  126, 172, 207, 244, 59,  98,  70,  26,  85,  30,
+      218, 102, 157, 91,  59,  133, 49,  3,   145, 241, 208, 68,  54,  13,  84,
+      249, 182, 16,  70,  152, 11,  184, 203, 220, 46,  119, 32,  168, 206, 63,
+      3,   108, 180, 73,  26,  10,  254, 201, 92,  243, 246, 143, 99,  186, 216,
+      51,  208, 131, 193, 182, 25,  242, 197, 170, 16,  60,  237, 170, 193, 87,
+      37,  140, 103, 55,  145, 242, 15,  118, 9,   33,  37,  103, 97,  241, 220,
+      99,  7,   69,  156, 185, 47,  94,  194, 135, 44,  54,  224, 135, 217, 160,
+      69,  253, 57,  58,  228, 53,  65,  201, 106, 105, 66,  157, 185, 19,  170,
+      141, 55,  55,  12,  114, 4,   113, 252, 32,  166, 127, 17,  228, 236, 23,
+      30,  17,  242, 236, 39,  215, 107, 187, 224, 246, 53,  26,  243, 120, 19,
+      26,  26,  22,  175, 181, 104, 194, 161, 192, 25,  176, 51,  100, 207, 137,
+      250, 125, 115, 231, 249, 14,  223, 31,  161, 194, 140, 226, 102, 210, 43,
+      146, 254, 251, 212, 4,   211, 138, 198, 62,  198, 174, 207, 0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   11,  241, 92,  203, 12,  128, 247, 140, 60,  47,  141, 226, 212, 234,
+      32,  66,  0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   117, 222, 214, 8,   99,  240,
+      40,  218, 0,   0,   0,   0,   0,   0,   0,   0,   204, 204, 221, 108, 194,
+      66,  233, 230, 0,   0,   0,   0,   0,   0,   0,   0,   164, 91,  127, 89,
+      51,  43,  87,  126, 0,   0,   0,   0,   0,   0,   0,   0,   103, 80,  249,
+      187, 217, 152, 133, 65,  0,   0,   0,   0,   0,   0,   0,   0,   164, 131,
+      158, 92,  37,  246, 208, 134, 0,   0,   0,   0,   0,   0,   0,   0,   28,
+      4,   211, 193, 186, 39,  7,   188, 0,   0,   0,   0,   0,   0,   0,   0,
+      64,  42,  121, 216, 118, 47,  242, 44,  0,   0,   0,   0,   0,   0,   0,
+      0,   248, 161, 215, 33,  60,  113, 206, 210, 0,   0,   0,   0,   0,   0,
+      0,   0,   205, 192, 81,  45,  132, 157, 201, 106, 183, 156, 198, 187, 0,
+      0,   0,   0,   254, 183, 131, 85,  139, 7,   245, 30,  230, 44,  243, 11,
+      0,   0,   0,   0,   24,  116, 161, 118, 240, 113, 161, 172, 26,  24,  150,
+      251, 0,   0,   0,   0,   43,  30,  81,  239, 141, 159, 216, 59,  77,  230,
+      199, 213, 0,   0,   0,   0,   36,  145, 99,  116, 147, 140, 90,  179, 237,
+      161, 251, 186, 0,   0,   0,   0,   13,  58,  154, 71,  196, 79,  206, 176,
+      140, 189, 1,   95,  0,   0,   0,   0,   48,  157, 37,  77,  93,  54,  180,
+      147, 237, 28,  11,  156, 0,   0,   0,   0,   203, 222, 181, 241, 46,  21,
+      120, 155, 207, 96,  100, 175, 0,   0,   0,   0,   41,  84,  184, 64,  8,
+      104, 228, 137, 228, 60,  147, 147, 0,   0,   0,   0,   88,  90,  35,  217,
+      195, 107, 117, 238, 122, 50,  107, 13,  0,   0,   0,   0,   21,  200, 244,
+      182, 240, 207, 181, 113, 105, 98,  30,  101, 0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,
+  };
+  return weights;
+}
+
+/// Test that IntNBitSplitEmbeddingBags is correctly supported in single
+/// feature with sum pooling
+TEST_P(OperatorTest, IntNBitSplitEmbeddingBagsSingle_Float) {
+  CHECK_IF_ENABLED();
+  Tensor expected(ElemKind::UInt8ITy, {2, 4});
+  // 2 floats:
+  // 6.896104335784912 = 1.724026083946228 * 4,
+  // 10.344156265258789 = 1.724026083946228 * 6
+  expected.getHandle<uint8_t>() = {
+      227, 172, 220, 64, 170, 129, 37, 65,
+  };
+
+  testIntNBitSplitEmbeddingBagsSingle<float, int32_t, float>(
+      bindings_, mod_, F_, EE_, SplitEmbeddingSparseType::EST_FLOAT,
+      ElemKind::Int32ITy, std::move(expected),
+      SplitEmbeddingPoolingMode::EP_SUM, SplitEmbeddingSparseType::EST_FLOAT,
+      0.0001);
+}
+
+/// Test that IntNBitSplitEmbeddingBags is correctly supported in single
+/// feature with mean pooling
+TEST_P(OperatorTest, IntNBitSplitEmbeddingBagsSingle_Float_MeanPooling) {
+  CHECK_IF_ENABLED();
+  Tensor expected(ElemKind::UInt8ITy, {2, 4});
+
+  // 2 floats: 1.724026083946228, 1.724026083946228
+  expected.getHandle<uint8_t>() = {
+      227, 172, 220, 63, 227, 172, 220, 63,
+  };
+
+  testIntNBitSplitEmbeddingBagsSingle<float, int32_t, float>(
+      bindings_, mod_, F_, EE_, SplitEmbeddingSparseType::EST_FLOAT,
+      ElemKind::Int32ITy, std::move(expected),
+      SplitEmbeddingPoolingMode::EP_MEAN, SplitEmbeddingSparseType::EST_FLOAT,
+      0.0001);
+}
+
+/// Test that IntNBitSplitEmbeddingBags is correctly supported in single
+/// feature with sum pooling in half floats
+TEST_P(OperatorTest, IntNBitSplitEmbeddingBagsSingle_Float16_SumPooling) {
+  CHECK_IF_ENABLED();
+  Tensor expected(ElemKind::UInt8ITy, {2, 4});
+
+  // 2 floats:
+  // -0.305419921875 = -0.07635498 * 4
+  // -0.4581298828125 = -0.07635498 * 6
+  expected.getHandle<uint8_t>() = {
+      0, 96, 156, 190, 0, 144, 234, 190,
+  };
+
+  testIntNBitSplitEmbeddingBagsSingle<float16_t, int32_t, float>(
+      bindings_, mod_, F_, EE_, SplitEmbeddingSparseType::EST_FLOAT16,
+      ElemKind::Int32ITy, std::move(expected),
+      SplitEmbeddingPoolingMode::EP_SUM, SplitEmbeddingSparseType::EST_FLOAT,
+      0.0001);
+}
+
+/// Test that IntNBitSplitEmbeddingBags is correctly supported in single
+/// feature with mean pooling in half floats
+TEST_P(OperatorTest, IntNBitSplitEmbeddingBagsSingle_Float16_MeanPooling) {
+  CHECK_IF_ENABLED();
+  Tensor expected(ElemKind::UInt8ITy, {2, 4});
+
+  // 2 floats: -0.07635498, -0.07635498
+  expected.getHandle<uint8_t>() = {
+      0, 96, 156, 189, 0, 96, 156, 189,
+  };
+
+  testIntNBitSplitEmbeddingBagsSingle<float16_t, int32_t, float>(
+      bindings_, mod_, F_, EE_, SplitEmbeddingSparseType::EST_FLOAT16,
+      ElemKind::Int32ITy, std::move(expected),
+      SplitEmbeddingPoolingMode::EP_MEAN, SplitEmbeddingSparseType::EST_FLOAT,
+      0.0001);
+}
+
+/// Test that IntNBitSplitEmbeddingBags is correctly supported in single
+/// feature with sum pooling in int8
+TEST_P(OperatorTest, IntNBitSplitEmbeddingBagsSingle_Int8_SumPooling) {
+  CHECK_IF_ENABLED();
+  Tensor expected(ElemKind::UInt8ITy, {2, 4});
+
+  // 2 floats:
+  // 7.859375 =  1.964840 * 4
+  // 11.7890625 =  1.964840 * 6
+  expected.getHandle<uint8_t>() = {
+      0, 128, 251, 64, 0, 160, 60, 65,
+  };
+
+  testIntNBitSplitEmbeddingBagsSingle<uint8_t, int32_t, float>(
+      bindings_, mod_, F_, EE_, SplitEmbeddingSparseType::EST_INT8,
+      ElemKind::Int32ITy, std::move(expected),
+      SplitEmbeddingPoolingMode::EP_SUM, SplitEmbeddingSparseType::EST_FLOAT,
+      0.0001);
+}
+
+/// Test that IntNBitSplitEmbeddingBags is correctly supported in single
+/// feature with mean pooling in int8
+TEST_P(OperatorTest, IntNBitSplitEmbeddingBagsSingle_Int8_MeanPooling) {
+  CHECK_IF_ENABLED();
+  Tensor expected(ElemKind::UInt8ITy, {2, 4});
+
+  // 2 floats: 1.96484375, 1.96484375
+  expected.getHandle<uint8_t>() = {
+      0, 128, 251, 63, 0, 128, 251, 63,
+  };
+
+  testIntNBitSplitEmbeddingBagsSingle<uint8_t, int32_t, float>(
+      bindings_, mod_, F_, EE_, SplitEmbeddingSparseType::EST_INT8,
+      ElemKind::Int32ITy, std::move(expected),
+      SplitEmbeddingPoolingMode::EP_MEAN, SplitEmbeddingSparseType::EST_FLOAT,
+      0.0001);
+}
+
+/// Test that IntNBitSplitEmbeddingBags is correctly supported in single
+/// feature with sum pooling in int4
+TEST_P(OperatorTest, IntNBitSplitEmbeddingBagsSingle_Int4_SumPooling) {
+  CHECK_IF_ENABLED();
+  Tensor expected(ElemKind::UInt8ITy, {2, 4});
+
+  // 2 floats:
+  // 7.859375 =  1.964840 * 4
+  // 11.7890625 =  1.964840 * 6
+  expected.getHandle<uint8_t>() = {
+      0, 128, 251, 64, 0, 160, 60, 65,
+  };
+
+  testIntNBitSplitEmbeddingBagsSingle<uint8_t, int32_t, float>(
+      bindings_, mod_, F_, EE_, SplitEmbeddingSparseType::EST_INT4,
+      ElemKind::Int32ITy, std::move(expected),
+      SplitEmbeddingPoolingMode::EP_SUM, SplitEmbeddingSparseType::EST_FLOAT,
+      0.0001);
+}
+
+/// Test that IntNBitSplitEmbeddingBags is correctly supported in single
+/// feature with mean pooling in int4
+TEST_P(OperatorTest, IntNBitSplitEmbeddingBagsSingle_Int4_MeanPooling) {
+  CHECK_IF_ENABLED();
+  Tensor expected(ElemKind::UInt8ITy, {2, 4});
+
+  // 2 floats: 1.96484375, 1.96484375
+  expected.getHandle<uint8_t>() = {
+      0, 128, 251, 63, 0, 128, 251, 63,
+  };
+
+  testIntNBitSplitEmbeddingBagsSingle<uint8_t, int32_t, float>(
+      bindings_, mod_, F_, EE_, SplitEmbeddingSparseType::EST_INT4,
+      ElemKind::Int32ITy, std::move(expected),
+      SplitEmbeddingPoolingMode::EP_MEAN, SplitEmbeddingSparseType::EST_FLOAT,
+      0.0001);
+}
+
+/// Test that IntNBitSplitEmbeddingBags is correctly supported in FloatTy.
+TEST_P(OperatorTest, IntNBitSplitEmbeddingBags_Float) {
+  CHECK_IF_ENABLED();
+  Tensor expected(ElemKind::UInt8ITy, {2, 104});
+  expected.getHandle<uint8_t>() = {
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   12,  177, 57,  224, 0,   0,   128, 127, 127, 218, 92,
+      120, 0,   0,   128, 255, 187, 236, 246, 127, 138, 116, 196, 247, 172, 118,
+      29,  251, 196, 93,  39,  253, 182, 66,  156, 103, 219, 39,  161, 239, 183,
+      8,   102, 32,  97,  138, 52,  64,  79,  73,  2,   159, 245, 48,  145, 72,
+      7,   180, 120, 108, 58,  114, 145, 150, 1,   81,  182, 133, 197, 75,  80,
+      34,  7,   177, 185, 222, 90,  44,  220, 41,  53,  135, 46,  227, 41,  85,
+      183, 166, 250, 156, 10,  50,  100, 103, 120, 95,  105, 10,  6,   222, 233,
+      76,  147, 254, 187, 236, 246, 127, 0,   0,   128, 127, 127, 218, 92,  119,
+      0,   0,   128, 255, 187, 236, 246, 127, 138, 116, 196, 247, 236, 212, 68,
+      251, 53,  53,  81,  253, 131, 4,   122, 103, 74,  5,   142, 107,
+  };
+
+  Tensor weightsOffsets(ElemKind::Int32ITy, {4});
+  weightsOffsets.getHandle<int32_t>() = {0, 384, 512, 640};
+
+  testIntNBitSplitEmbeddingBags<float, int32_t, float>(
+      bindings_, mod_, F_, EE_, ElemKind::Float16Ty, ElemKind::Int32ITy,
+      getIntNBitSplitEmbeddingBagsWeightsFloat(), std::move(weightsOffsets),
+      std::move(expected), SplitEmbeddingPoolingMode::EP_SUM,
+      SplitEmbeddingSparseType::EST_FLOAT, 0.0001);
+}
+
+TEST_P(OperatorTest, IntNBitSplitEmbeddingBags_Float_MeanPooling) {
+  CHECK_IF_ENABLED();
+  Tensor expected(ElemKind::UInt8ITy, {2, 104});
+  expected.getHandle<uint8_t>() = {
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   187, 150, 119, 221, 0,   0,   128, 127, 85,  60,  147,
+      117, 0,   0,   128, 255, 187, 236, 246, 127, 225, 202, 74,  245, 4,   139,
+      162, 248, 227, 195, 172, 250, 31,  77,  33,  101, 177, 90,  38,  237, 183,
+      8,   102, 32,  97,  138, 52,  64,  79,  73,  2,   159, 245, 48,  145, 72,
+      7,   180, 120, 108, 58,  114, 145, 150, 1,   81,  182, 133, 197, 75,  80,
+      34,  7,   177, 185, 222, 90,  44,  220, 41,  53,  135, 46,  227, 41,  85,
+      183, 166, 250, 156, 10,  50,  100, 103, 120, 95,  105, 10,  6,   222, 233,
+      76,  147, 254, 187, 236, 246, 127, 0,   0,   128, 127, 155, 95,  172, 116,
+      0,   0,   128, 255, 187, 236, 246, 127, 40,  230, 56,  245, 222, 64,  185,
+      248, 200, 230, 196, 250, 138, 79,  235, 100, 160, 170, 5,   105,
+  };
+
+  Tensor weightsOffsets(ElemKind::Int32ITy, {4});
+  weightsOffsets.getHandle<int32_t>() = {0, 384, 512, 640};
+  testIntNBitSplitEmbeddingBags<float, int32_t, float>(
+      bindings_, mod_, F_, EE_, ElemKind::Float16Ty, ElemKind::Int32ITy,
+      getIntNBitSplitEmbeddingBagsWeightsFloat(), std::move(weightsOffsets),
+      std::move(expected), SplitEmbeddingPoolingMode::EP_MEAN,
+      SplitEmbeddingSparseType::EST_FLOAT, 0.0001);
+}
+
+/// Test that IntNBitSplitEmbeddingBags is correctly supported in Float16Ty.
+TEST_P(OperatorTest, IntNBitSplitEmbeddingBags_Float16) {
+  CHECK_IF_ENABLED();
+
+  Tensor expected(ElemKind::UInt8ITy, {2, 52});
+  expected.getHandle<uint8_t>() = {
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   76,  227, 74,  122, 0,   252, 0,   126, 0,   124, 0,   124, 0,
+      124, 94,  244, 131, 240, 0,   252, 242, 15,  118, 9,   33,  37,  103, 97,
+      241, 220, 99,  7,   69,  156, 185, 47,  0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   54,  122, 0,   124, 0,   252,
+      0,   126, 0,   124, 0,   124, 0,   124, 116, 246, 48,  242, 0,   252,
+  };
+
+  Tensor weightsOffsets(ElemKind::Int32ITy, {4});
+  weightsOffsets.getHandle<int32_t>() = {0, 256, 384, 512};
+
+  testIntNBitSplitEmbeddingBags<float16_t, int32_t, float16_t>(
+      bindings_, mod_, F_, EE_, ElemKind::Float16Ty, ElemKind::Int32ITy,
+      getIntNBitSplitEmbeddingBagsWeightsFloat16(), std::move(weightsOffsets),
+      std::move(expected), SplitEmbeddingPoolingMode::EP_SUM,
+      SplitEmbeddingSparseType::EST_FLOAT16, 0.005);
+}
+
+TEST_P(OperatorTest, IntNBitSplitEmbeddingBags_Float16_MeanPooling) {
+  CHECK_IF_ENABLED();
+  Tensor expected(ElemKind::UInt8ITy, {2, 52});
+  expected.getHandle<uint8_t>() = {
+      0,   0,   0,   0,   0,   0,   0,   0,   0,  0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,  0,   0,   0,   0,   0,   0,
+      0,   0,   221, 204, 49,  100, 0,   252, 0,  126, 0,   124, 0,   124, 0,
+      124, 130, 224, 168, 220, 0,   252, 242, 15, 118, 9,   33,  37,  103, 97,
+      241, 220, 99,  7,   69,  156, 185, 47,  0,  0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,  217, 100, 0,   124, 0,   252,
+      0,   126, 0,   124, 0,   124, 0,   124, 19, 226, 211, 221, 0,   252,
+  };
+  Tensor weightsOffsets(ElemKind::Int32ITy, {4});
+  weightsOffsets.getHandle<int32_t>() = {0, 256, 384, 512};
+
+  testIntNBitSplitEmbeddingBags<float16_t, int32_t, float16_t>(
+      bindings_, mod_, F_, EE_, ElemKind::Float16Ty, ElemKind::Int32ITy,
+      getIntNBitSplitEmbeddingBagsWeightsFloat16(), std::move(weightsOffsets),
+      std::move(expected), SplitEmbeddingPoolingMode::EP_MEAN,
+      SplitEmbeddingSparseType::EST_FLOAT16, 0.005);
+}
+
+/// Test IntNBitSplitEmbeddingWeightedBags
+template <typename WeightTy, typename IndexTy, typename OutputTy>
+static void testIntNBitSplitEmbeddingWeightedBags(
+    glow::PlaceholderBindings &bindings, glow::Module &mod, glow::Function *F,
+    glow::ExecutionEngine &EE, ElemKind DTy, ElemKind IdxTy, Tensor Weights,
+    Tensor WeightsOffsets, Tensor expected,
+    SplitEmbeddingSparseType outputDType, float allowedError) {
+  Tensor devWeightsTensorReal = Weights.clone();
+  Tensor uvmWeightsTensorReal = Weights.clone();
+  Tensor indicesTensorReal(IdxTy, {157});
+  Tensor offsetsTensorReal(IdxTy, {9});
+  Tensor weightsOffsetsTensorReal = std::move(WeightsOffsets);
+  Tensor dimOffsetsTensorReal(ElemKind::Int32ITy, {5});
+  Tensor weightsPlacementReal(ElemKind::Int32ITy, {4});
+  Tensor weightsTysTensorReal(ElemKind::UInt8ITy, {4});
+  Tensor indiceWeightsTensorReal(ElemKind::FloatTy, {157});
+
+  indicesTensorReal.getHandle<IndexTy>() = {
+      5, 3, 6, 0, 0, 5, 6, 6, 5, 7, 1, 1, 7, 6, 3,  1, 4,  1,  3, 3, 6,  1, 1,
+      6, 7, 2, 5, 4, 6, 7, 1, 4, 1, 4, 4, 5, 4, 2,  3, 6,  4,  0, 4, 2,  6, 7,
+      5, 0, 1, 3, 1, 2, 1, 5, 9, 3, 8, 4, 1, 4, 10, 4, 1,  1,  1, 7, 4,  7, 2,
+      2, 4, 3, 4, 9, 8, 8, 5, 5, 5, 2, 6, 7, 4, 7,  6, 6,  10, 0, 3, 10, 5, 4,
+      3, 3, 3, 4, 4, 9, 9, 7, 2, 1, 7, 4, 2, 9, 6,  6, 10, 5,  1, 0, 6,  3, 6,
+      2, 9, 3, 9, 3, 1, 3, 2, 3, 1, 3, 7, 2, 3, 3,  8, 7,  4,  7, 8, 9,  2, 3,
+      3, 4, 4, 8, 3, 4, 1, 9, 2, 1, 9, 2, 6, 8, 3,  3, 4,  2,  9,
+  };
+  offsetsTensorReal.getHandle<IndexTy>() = {0, 0, 1, 2, 3, 51, 92, 123, 157};
+  dimOffsetsTensorReal.getHandle<int32_t>() = {0, 8, 16, 20, 26};
+  weightsPlacementReal.getHandle<int32_t>() = {3, 1, 2, 3};
+  if (std::is_same<WeightTy, float>::value) {
+    weightsTysTensorReal.getHandle<uint8_t>() = {0, 0, 0, 0};
+  } else {
+    weightsTysTensorReal.getHandle<uint8_t>() = {1, 1, 1, 1};
+  }
+  indiceWeightsTensorReal.getHandle<float>() = {
+      0.73059422, 0.09048918, 0.554031,   0.13158787, 0.23915586, 0.3018666,
+      0.6207229,  0.57457829, 0.33964851, 0.02707603, 0.92231585, 0.64477818,
+      0.67243994, 0.58562965, 0.30533718, 0.54483425, 0.53211636, 0.12025826,
+      0.34783277, 0.92105082, 0.93280413, 0.30841353, 0.67953576, 0.16194991,
+      0.2832056,  0.48093265, 0.18568761, 0.20272573, 0.71193419, 0.38782271,
+      0.10420006, 0.18165586, 0.73882372, 0.19265882, 0.62022048, 0.97320652,
+      0.21687336, 0.61186471, 0.84622618, 0.2533562,  0.37639096, 0.29951705,
+      0.61392843, 0.93121569, 0.26724258, 0.80117613, 0.37856814, 0.20297429,
+      0.90158672, 0.8148197,  0.11421551, 0.80284475, 0.38450052, 0.84448327,
+      0.61715987, 0.36695459, 0.02693524, 0.44444055, 0.33264582, 0.08956304,
+      0.7469183,  0.40471427, 0.15962103, 0.46057547, 0.8303796,  0.48742954,
+      0.22941005, 0.82710538, 0.51743851, 0.63713515, 0.27360268, 0.28787691,
+      0.68998699, 0.91243272, 0.92242145, 0.00800144, 0.44966546, 0.23878438,
+      0.33966388, 0.26723466, 0.68331924, 0.06104597, 0.28901017, 0.3702946,
+      0.91717632, 0.01063433, 0.01559091, 0.68447562, 0.26032356, 0.82551908,
+      0.71921533, 0.3309967,  0.34700732, 0.46732838, 0.98460019, 0.97221335,
+      0.30027433, 0.890952,   0.30998982, 0.19929673, 0.16206062, 0.3012844,
+      0.15551239, 0.09132537, 0.69239636, 0.61895815, 0.7683584,  0.85551139,
+      0.56375194, 0.6407271,  0.37005971, 0.48018709, 0.91556693, 0.52716185,
+      0.3401635,  0.51378091, 0.34776683, 0.91414342, 0.08269295, 0.3923621,
+      0.89205286, 0.62261808, 0.93271026, 0.65990633, 0.00268492, 0.02678248,
+      0.61158337, 0.8550025,  0.16225994, 0.43618449, 0.86736373, 0.55277513,
+      0.68459586, 0.84311144, 0.53162982, 0.28421924, 0.33122102, 0.47700932,
+      0.92586793, 0.13141876, 0.96422898, 0.10795071, 0.10225672, 0.03472978,
+      0.83985586, 0.87896339, 0.91911041, 0.83078131, 0.7561809,  0.13999207,
+      0.44837753, 0.81394738, 0.74990102, 0.9324097,  0.64143043, 0.55022502,
+      0.97235411,
+  };
+
+  auto devWeights = mod.createPlaceholder(ElemKind::UInt8ITy,
+                                          devWeightsTensorReal.getSizeInBytes(),
+                                          "devWeights", false);
+  auto indices = mod.createPlaceholder(IdxTy, {157}, "indices", false);
+  auto offsets = mod.createPlaceholder(IdxTy, {9}, "offsets", false);
+  auto weightsOffsets =
+      mod.createPlaceholder(ElemKind::Int32ITy, {4}, "weightsOffsets", false);
+  auto dimOffsets =
+      mod.createPlaceholder(ElemKind::Int32ITy, {5}, "dimOffsets", false);
+  auto uvmWeights = mod.createPlaceholder(ElemKind::UInt8ITy,
+                                          uvmWeightsTensorReal.getSizeInBytes(),
+                                          "uvmWeights", false);
+  auto weightsPlacement =
+      mod.createPlaceholder(ElemKind::Int32ITy, {4}, "weightsPlacement", false);
+  auto weightsTys =
+      mod.createPlaceholder(ElemKind::UInt8ITy, {4}, "weightsTys", false);
+  auto indiceWeights =
+      mod.createPlaceholder(DTy, {157}, "indiceWeights", false);
+
+  bindings.insert(devWeights, std::move(devWeightsTensorReal));
+  bindings.insert(uvmWeights, std::move(uvmWeightsTensorReal));
+  bindings.insert(indices, std::move(indicesTensorReal));
+  bindings.insert(offsets, std::move(offsetsTensorReal));
+  bindings.insert(weightsOffsets, std::move(weightsOffsetsTensorReal));
+  bindings.insert(dimOffsets, std::move(dimOffsetsTensorReal));
+  bindings.insert(weightsPlacement, std::move(weightsPlacementReal));
+  bindings.insert(indiceWeights, std::move(indiceWeightsTensorReal));
+  bindings.insert(weightsTys, std::move(weightsTysTensorReal));
+
+  auto *R = F->createIntNBitSplitEmbeddingWeightedBags(
+      "IntNBitSplitEmbeddingWeightedBags", devWeights, uvmWeights,
+      weightsPlacement, weightsOffsets, weightsTys, dimOffsets, 26, indices,
+      offsets, SplitEmbeddingPoolingMode::EP_SUM, outputDType, indiceWeights);
+  auto *S = F->createSave("save", R);
+  bindings.allocate(S->getPlaceholder());
+
+  EE.compile(CompilationMode::Infer);
+  EE.run(bindings);
+
+  Tensor &result = *bindings.get(S->getPlaceholder());
+
+  EXPECT_TRUE(expected.isEqual(result, allowedError));
+}
+
+/// Test that IntNBitSplitEmbeddingBags is correctly supported in FloatTy.
+TEST_P(OperatorTest, IntNBitSplitEmbeddingWeightedBags_Float) {
+  CHECK_IF_ENABLED();
+  Tensor expected(ElemKind::UInt8ITy, {2, 104});
+  expected.getHandle<uint8_t>() = {
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   245, 82,  136, 223, 0,   0,   128, 127, 102, 219, 64,
+      119, 110, 123, 32,  255, 187, 236, 246, 127, 35,  194, 76,  247, 98,  40,
+      181, 250, 241, 140, 192, 252, 49,  168, 12,  103, 94,  146, 78,  239, 193,
+      15,  40,  32,  225, 230, 3,   64,  120, 95,  190, 158, 218, 38,  84,  72,
+      126, 179, 53,  108, 57,  134, 84,  150, 7,   51,  133, 133, 10,  46,  24,
+      34,  250, 193, 77,  222, 51,  247, 115, 41,  85,  99,  193, 226, 218, 36,
+      75,  166, 142, 151, 153, 49,  154, 159, 9,   95,  127, 134, 148, 221, 208,
+      55,  35,  254, 187, 236, 246, 127, 0,   0,   128, 127, 57,  43,  23,  119,
+      54,  227, 62,  255, 187, 236, 246, 127, 190, 39,  91,  247, 241, 25,  220,
+      250, 195, 240, 233, 252, 185, 190, 52,  103, 119, 207, 30,  107,
+  };
+
+  Tensor weightsOffsets(ElemKind::Int32ITy, {4});
+  weightsOffsets.getHandle<int32_t>() = {0, 384, 512, 640};
+  testIntNBitSplitEmbeddingWeightedBags<float, int32_t, float>(
+      bindings_, mod_, F_, EE_, ElemKind::FloatTy, ElemKind::Int32ITy,
+      getIntNBitSplitEmbeddingBagsWeightsFloat(), std::move(weightsOffsets),
+      std::move(expected), SplitEmbeddingSparseType::EST_FLOAT, 0.0001);
+}
+
+/// Test that IntNBitSplitEmbeddingBags is correctly supported in Float16Ty.
+TEST_P(OperatorTest, IntNBitSplitEmbeddingWeightedBags_Float16) {
+  CHECK_IF_ENABLED();
+  Tensor expected(ElemKind::UInt8ITy, {2, 104});
+  expected.getHandle<uint8_t>() = {
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   233, 171, 22,  67,  217, 126, 202, 70,  20,  86,  100,
+      199, 0,   224, 202, 127, 212, 222, 23,  71,  26,  97,  70,  71,  147, 61,
+      16,  71,  201, 211, 206, 197, 84,  56,  193, 197, 220, 5,   11,  200, 235,
+      192, 185, 57,  186, 87,  255, 56,  75,  209, 111, 60,  91,  154, 252, 67,
+      232, 12,  103, 195, 184, 177, 172, 56,  135, 162, 71,  187, 80,  140, 180,
+      61,  0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   0,   134, 249, 209, 70,  188, 229, 86,  71,  208, 250, 17,  199,
+      0,   224, 202, 127, 189, 151, 54,  71,  140, 36,  117, 71,  17,  100, 68,
+      71,  212, 88,  149, 198, 30,  185, 186, 197, 163, 15,  42,  200,
+  };
+
+  Tensor weightsOffsets(ElemKind::Int32ITy, {4});
+  weightsOffsets.getHandle<int32_t>() = {0, 256, 384, 512};
+  testIntNBitSplitEmbeddingWeightedBags<float16_t, int32_t, float16_t>(
+      bindings_, mod_, F_, EE_, ElemKind::FloatTy, ElemKind::Int32ITy,
+      getIntNBitSplitEmbeddingBagsWeightsFloat16(), std::move(weightsOffsets),
+      std::move(expected), SplitEmbeddingSparseType::EST_FLOAT, 0.005);
 }
 
 INSTANTIATE_BACKEND_TEST(OperatorStatelessTest);

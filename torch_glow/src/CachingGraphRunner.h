@@ -18,7 +18,9 @@
 #define GLOW_TORCH_GLOW_SRC_CACHINGGRAPHRUNNER_H
 
 #include "PyTorchModelLoader.h"
+#include "glow/Backend/BlockStreamBase.h"
 #include "glow/Runtime/HostManager/HostManager.h"
+#include "glow/Runtime/InputSanitizer.h"
 #include "glow/Support/TensorPool.h"
 
 #include <torch/csrc/jit/ir/ir.h>
@@ -48,6 +50,10 @@ public:
     /// Input and output placeholders to the Glow function.
     std::vector<glow::Placeholder *> inputPlaceholders;
     std::vector<glow::Placeholder *> outputPlaceholders;
+
+    /// Input sanitizers that should help prevent passing invalid
+    /// inputs to the backend.
+    std::vector<runtime::InputSanitizerPtr> inputSanitizers;
 
     /// Name of the Glow function maintained by HostManager for this subgraph.
     std::string functionName;
@@ -190,7 +196,7 @@ private:
   /// contiguous. The new PyTorch tensor owns the memory used by the Glow tensor
   /// so much live at least as long as it.
   Expected<std::pair<glow::Tensor, torch::Tensor>>
-  convertPyTorchInputToGlowInput(torch::Tensor ptTensor,
+  convertPyTorchInputToGlowInput(torch::Tensor &&ptTensor,
                                  const glow::Placeholder *ph);
 
   /// Calls convertPyTorchInputToGlowInput for several \p inputs and \p
@@ -231,10 +237,23 @@ public:
   /// settings enable different settings for each compilation. If \p
   /// useMaxSizeCompilation , compile only a single Glow graph with an
   /// upper-bound on the input sizes (smaller inputs will be padded by Glow.)
-  Error warmCache(const std::vector<InputMetaStack> &metaStacks,
-                  const PyTorchLoaderSettings &settings,
-                  runtime::DeferredWeightLoader *loader,
-                  bool useMaxSizeCompilation = true);
+  /// \p glowAOTSerializationSpecStrPtr and \p glowAOTSerializationModelStrPtr
+  /// are used in offline Glow AOT compilation (i.e., Glow serialization), while
+  /// \p serializationSpec and \p onnxModelFile are used for online serving
+  /// (i.e., Glow deserialization)
+  Error warmCache(
+      const std::vector<InputMetaStack> &metaStacks,
+      const PyTorchLoaderSettings &settings,
+      runtime::DeferredWeightLoader *loader, bool useMaxSizeCompilation = true,
+      bool useDeserialize = false,
+      std::shared_ptr<std::unordered_map<std::string, std::vector<char>>>
+          nameToFunctions = nullptr,
+      std::shared_ptr<std::string> glowAOTSerializationSpecStrPtr = nullptr,
+      std::shared_ptr<std::string> glowAOTSerializationModelStrPtr = nullptr,
+      const std::string &serializationSpec = "",
+      const std::string &onnxModelFile = "",
+      const c10::optional<ModelCompilationConfigOverride>
+          &modelCompilationConfigOverride = c10::nullopt);
 
   /// Warmup Graphoutput shape Map by getting output value shapes for each
   /// batch size.
@@ -256,6 +275,12 @@ public:
   Error writeJitIOToOnnxFile(const std::string &inputFilePrefix,
                              const std::string &outputFilePrefix,
                              const torch::jit::Stack &stack);
+
+  /// Get all serialized function maps run in backend.
+  /// Each time it is called, it will refresh the map.
+  std::unique_ptr<
+      std::unordered_map<std::string, std::unique_ptr<BlockStreamBase>>>
+  getAllSerializedFunctionsMap();
 };
 
 } // namespace glow

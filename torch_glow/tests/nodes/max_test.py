@@ -1,3 +1,17 @@
+# Copyright (c) Glow Contributors. See CONTRIBUTORS file.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 import torch
@@ -18,6 +32,17 @@ class UnaryMaxModule(torch.nn.Module):
 
     def forward(self, a):
         return torch.max(a + a)
+
+
+class ReduceMaxModule(torch.nn.Module):
+    def __init__(self, dim, keep_dim):
+        super(ReduceMaxModule, self).__init__()
+        self.dim = dim
+        self.keep_dim = keep_dim
+
+    def forward(self, a):
+        values, index = torch.max(a + a, self.dim, self.keep_dim)
+        return torch.stack((values, index))
 
 
 class TestMax(utils.TorchGlowTestCase):
@@ -51,5 +76,23 @@ class TestMax(utils.TorchGlowTestCase):
                 ),
                 dtype=torch.int,
             ),
+            fusible_ops={"aten::max"},
+        )
+
+    def test_reduce_max(self):
+        """Test of the PyTorch max Node reducing on a specified dim."""
+
+        utils.compare_tracing_methods(
+            ReduceMaxModule(2, False),
+            torch.randn(3, 4, 5),
+            fusible_ops={"aten::max"},
+        )
+
+    def test_reduce_max_keep_dim(self):
+        """Test of the PyTorch max Node reducing on a specified dim and keeping dim."""
+
+        utils.compare_tracing_methods(
+            ReduceMaxModule(2, True),
+            torch.randn(3, 4, 5),
             fusible_ops={"aten::max"},
         )

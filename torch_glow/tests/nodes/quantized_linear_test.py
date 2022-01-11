@@ -1,3 +1,17 @@
+# Copyright (c) Glow Contributors. See CONTRIBUTORS file.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import torch
 from tests import utils
 
@@ -25,17 +39,17 @@ class SimpleQuantizedLinearModel(torch.nn.Sequential):
         )
 
         weight_observer = (
-            torch.quantization.default_weight_observer
+            torch.ao.quantization.default_weight_observer
             if per_tensor
-            else torch.quantization.default_per_channel_weight_observer
+            else torch.ao.quantization.default_per_channel_weight_observer
         )
-        self.qconfig = torch.quantization.QConfig(
-            activation=torch.quantization.default_observer,
+        self.qconfig = torch.ao.quantization.QConfig(
+            activation=torch.ao.quantization.default_observer,
             weight=weight_observer,
         )
 
-        torch.quantization.prepare(self, inplace=True)
-        torch.quantization.convert(self, inplace=True)
+        torch.ao.quantization.prepare(self, inplace=True)
+        torch.ao.quantization.convert(self, inplace=True)
 
 
 def _make_input(size, duplications, shape, dtype=torch.float):

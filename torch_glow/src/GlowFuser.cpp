@@ -308,11 +308,11 @@ static void dumpOperatorStats(const std::shared_ptr<torch::jit::Graph> graph,
   out << "InstanceCount: count of operator in graph\n";
   out << "FuseSupported: instances with IsSupportFunc returning true\n";
   out << "Fused: instances of operator that were merged into a subgraph\n";
-  out << folly::stringPrintf("%30s %13s %13s %13s\n", "Operator",
+  out << folly::stringPrintf("%45s %13s %13s %13s\n", "Operator",
                              "InstanceCount", "FuseSupported", "Fused");
   for (auto &kindAndStat : fuserStats) {
     out << folly::stringPrintf(
-        "%30s %13ld %13ld %13ld\n", kindAndStat.first.toQualString(),
+        "%45s %13ld %13ld %13ld\n", kindAndStat.first.toQualString(),
         kindAndStat.second.totalCount, kindAndStat.second.supportedCount,
         kindAndStat.second.fusedCount);
   }
@@ -428,14 +428,14 @@ void glowCustomFuseImpl(std::shared_ptr<torch::jit::Graph> graph,
   // Wrap fn in function that first checks the blacklist.
   IsSupportFunc nodeSupportedFn =
       [indexBlacklist = std::move(indexBlacklistedNodes),
-       opBlacklist = settings.opBlacklist, fn](const torch::jit::Node *ptNode) {
+       opBlocklist = settings.opBlocklist, fn](const torch::jit::Node *ptNode) {
         if (indexBlacklist.count(ptNode)) {
           VLOG(1) << "Skipping " << ptNode->kind().toQualString()
                   << " op because it's outside of the fusion range";
           return false;
         }
 
-        if (opBlacklist.count(ptNode->kind())) {
+        if (opBlocklist.count(ptNode->kind())) {
           VLOG(1) << "Skipping " << ptNode->kind().toQualString()
                   << " op because its kind is blacklisted";
           return false;
@@ -456,13 +456,15 @@ void glowCustomFuseImpl(std::shared_ptr<torch::jit::Graph> graph,
   // Prepare the graph by fusing known patterns for the model loader.
   // TODO: this should be done only on Glow subgraphs to avoid modifying parts
   // of the graph that Glow will not be running.
-  fuseKnownPatterns(graph, settings.opBlacklist);
+  fuseKnownPatterns(graph, settings.opBlocklist);
 
   fuseJITNodesToGlow(graph, nodeSupportedFn, kind, maxFusionMergeSize);
 
   if (minFusionGroupSize > 0) {
     unfuseSmallGraphs(graph, minFusionGroupSize, kind);
   }
+
+  unfuseDummyOperators(graph);
 
   EliminateCommonSubexpression(graph);
 

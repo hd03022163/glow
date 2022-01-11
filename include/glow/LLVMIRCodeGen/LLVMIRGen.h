@@ -27,6 +27,8 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/IPO.h"
+#include "llvm/Transforms/IPO/PassManagerBuilder.h"
 
 namespace glow {
 
@@ -124,7 +126,7 @@ protected:
   /// Set of emitted LLVM functions for IR functions.
   llvm::SmallVector<llvm::Function *, 4> emittedLLVMFunctions_;
   /// The LLVM context.
-  llvm::LLVMContext ctx_;
+  std::unique_ptr<llvm::LLVMContext> ctx_;
   /// The LLVM IR module.
   std::unique_ptr<llvm::Module> llmodule_{nullptr};
   /// The target machine.
@@ -135,6 +137,8 @@ protected:
   std::string bundleName_;
   /// Name of the main entry.
   std::string mainEntryName_;
+  /// Base name of the saved bundle file, without extension.
+  std::string savedBundleName_;
   /// Instruction number for the module.
   std::unique_ptr<InstructionNumbering> instrNumbering_;
   /// Value holding the base address of the activations memory area.
@@ -188,8 +192,8 @@ protected:
                                  llvm::DenseMap<Value *, int> &bufferToArgNum);
   /// Generates LLVM IR that computes the size of the tensor of \p val using
   /// \p builder. The size type is native to the machine (size_t).
-  llvm::Value *emitValueSize(llvm::IRBuilder<> &builder,
-                             const glow::Value *val);
+  virtual llvm::Value *emitValueSize(llvm::IRBuilder<> &builder,
+                                     const glow::Value *val);
   /// Generates LLVM IR that materializes the constant \p val.
   llvm::Value *emitConstF32(llvm::IRBuilder<> &builder, float val);
   /// Generates LLVM IR that materializes the constant \p val.
@@ -246,8 +250,8 @@ protected:
 
   /// Generates LLVM IR that computes the dimensions of \p val using \p builder.
   /// The result type is "size_t*".
-  llvm::Value *emitValueDims(llvm::IRBuilder<> &builder,
-                             const glow::Value *val);
+  virtual llvm::Value *emitValueDims(llvm::IRBuilder<> &builder,
+                                     const glow::Value *val);
 
   /// Generates LLVM IR that materializes the float activation parameters for
   /// the instruction \p I.
@@ -346,6 +350,11 @@ public:
   /// Init the TargetMachine using settings provided by \p llvmBackend.
   virtual void initTargetMachine(const LLVMBackendOptions &opts);
 
+  /// Init the TargetOptions \p targetOpts in a backend-specific way. Use \p
+  /// backendOpts as input if necessary.
+  virtual void initTargetOptions(llvm::TargetOptions &targetOpts,
+                                 const LLVMBackendOptions &backendOpts);
+
   /// Emit LLVM-IR for the instruction \p I, using the builder \p builder.
   /// Derived classes may want to override this function to implement a
   /// backend-specific LLVM IR generation logic for some intructions.
@@ -392,12 +401,19 @@ public:
   virtual void optimizeLLVMModule(llvm::Module *M, llvm::TargetMachine &TM);
   /// Performs specialization of operations based on constant parameters.
   virtual void performSpecialization();
+  /// Insert debug traces in appropriate places.
+  virtual void performDebugInstrumentation();
   /// \returns allocations info.
   virtual AllocationsInfo &getAllocationsInfo() { return allocationsInfo_; }
   /// \returns the name of the bundle, to be used for filename when saving.
   llvm::StringRef getBundleName() const;
   /// Set the name of the bundle (name is automatically legalized).
   void setBundleName(const std::string &name);
+  /// \returns the base name of the saved bundle file to be used by a
+  /// BundleSaver.
+  llvm::StringRef getSavedBundleName() const;
+  /// Set the base name of the saved bundle file.
+  void setSavedBundleName(const std::string &name);
   /// \returns the name of the main entry point.
   /// When JITting, it will be "main". In case of bundling it will be the name
   /// of the bundle.
@@ -414,8 +430,18 @@ public:
   llvm::IRBuilder<> &getBuilder() { return *builder_; }
   /// \returns the target machine description.
   llvm::TargetMachine &getTargetMachine() { return *TM_; }
+  /// Takes the target machine for further processing, e.g. by a JIT.
+  /// The target machine cannot be used by the LLVMIRGen afterwards.
+  std::unique_ptr<llvm::TargetMachine> takeTargetMachine() {
+    return std::move(TM_);
+  }
   /// \returns the LLVMContext being used.
-  llvm::LLVMContext &getLLVMContext() { return ctx_; }
+  llvm::LLVMContext &getLLVMContext() { return *ctx_; }
+  /// Takes the LLVM Context for further processing, e.g. by a JIT.
+  /// The context cannot be used by the LLVMIRGen afterwards.
+  std::unique_ptr<llvm::LLVMContext> takeLLVMContext() {
+    return std::move(ctx_);
+  }
   /// Borrows the LLVM module for further processing, e.g. by a JIT.
   /// The module cannot be used by the LLVMIRGen afterwards.
   std::unique_ptr<llvm::Module> borrowModule() { return std::move(llmodule_); }
@@ -458,6 +484,8 @@ public:
   /// \returns inlining mode to be used for a function \p F.
   virtual llvm::Attribute::AttrKind
   getInlinineAttr(const llvm::Function *F) const;
+  /// Configures a provided PassManagerBuilder \p PMB in a backend-specific way
+  virtual void populatePassManagerBuilderOptions(llvm::PassManagerBuilder &PMB);
   /// Update inline attributes of functions in the module \p M using a
   /// backend-specific logic.
   virtual void updateInlineAttributes(llvm::Module *M);

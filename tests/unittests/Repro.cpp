@@ -79,7 +79,7 @@ llvm::cl::opt<std::string> ExecutionBackend(
     "backend", llvm::cl::desc("Backend to use, e.g., Interpreter, CPU, NNPI:"),
     llvm::cl::init("NNPI"), llvm::cl::cat(reproTestCat));
 
-llvm::cl::opt<unsigned> concurrentRequestsOpt(
+llvm::cl::opt<unsigned> concurrentCountOpt(
     "concurrent_count", llvm::cl::desc("Number of concurrent requests."),
     llvm::cl::Optional, llvm::cl::init(1), llvm::cl::cat(reproTestCat));
 
@@ -121,8 +121,14 @@ llvm::cl::opt<bool, /* ExternalStorage */ true> enablePartialTensorOpt(
     llvm::cl::init(true), llvm::cl::cat(reproTestCat));
 
 llvm::cl::opt<unsigned> itersOpt(
-    "iters", llvm::cl::desc("Number of times to loop over provided input."),
+    "iters",
+    llvm::cl::desc("Total number of requests to loop over provided input."),
     llvm::cl::Optional, llvm::cl::init(1), llvm::cl::cat(reproTestCat));
+
+llvm::cl::alias requestCountOpt("request_count",
+                                llvm::cl::desc("Alias for -iters"),
+                                llvm::cl::aliasopt(itersOpt));
+
 llvm::cl::opt<unsigned> durationMinOpt(
     "duration_min", llvm::cl::desc("Running duration limit in minutes"),
     llvm::cl::Optional, llvm::cl::init(0), llvm::cl::cat(reproTestCat));
@@ -501,6 +507,11 @@ int run() {
     cctx.dumpFinalGraph = true;
     cctx.dumpGraphPath = glow::flags::DumpGraphPath;
   }
+  if (glow::flags::SinkTanhBelowConcat) {
+    cctx.optimizationOpts.sinkTanhBelowConcat =
+        glow::flags::SinkTanhBelowConcat;
+    LOG(INFO) << "Sinking tanh below concat";
+  }
 
   if (glow::flags::UseSparseNNPartitioningScheme) {
     cctx.optimizationOpts.useSparseNNPartitioningScheme = true;
@@ -676,11 +687,13 @@ int run() {
   }
 
   llvm::outs() << "Starting inference\n";
+  llvm::outs().flush(); // Explicit flush to denote the progress
+
   auto nowTime = std::chrono::steady_clock::now();
   auto endTimeDuration = nowTime + std::chrono::minutes(durationMinOpt);
   do {
     TraceContext mergedTraceContext(TraceLevel::STANDARD);
-    folly::CPUThreadPoolExecutor threadPool(concurrentRequestsOpt);
+    folly::CPUThreadPoolExecutor threadPool(concurrentCountOpt);
     std::mutex mutex;
     std::condition_variable cv;
     int numTotalInferences = inputGroupSize * itersOpt;
@@ -696,7 +709,7 @@ int run() {
     std::copy_if(placeholderList.begin(), placeholderList.end(),
                  std::back_inserter(inputPlaceholderList),
                  [&](const glow::Placeholder *p) {
-                   return inputTensorNames.find(p->getName()) !=
+                   return inputTensorNames.find(p->getName().str()) !=
                           inputTensorNames.end();
                  });
 
@@ -986,12 +999,16 @@ int run() {
         }
       }
     }
+
+    llvm::outs().flush();
+
     std::chrono::duration<double, std::milli> duration = endTime - startTime;
     std::cout << "Total inference duration (ms): " << duration.count() << "\n";
     std::cout << "Avg inference duration (ms): "
               << duration.count() / numTotalInferences << "\n";
     std::cout << "Avg inference per second: "
-              << numTotalInferences * 1000 / duration.count() << "\n";
+              << numTotalInferences * 1000 / duration.count()
+              << std::endl; // Use endl to flush the buffer
     nowTime = std::chrono::steady_clock::now();
   } while (std::chrono::duration_cast<std::chrono::seconds>(nowTime -
                                                             endTimeDuration)

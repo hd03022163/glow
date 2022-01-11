@@ -14,14 +14,14 @@
  * limitations under the License.
  */
 
-#include "glow/LLVMIRCodeGen/CommandLine.h"
-
 #include "glow/LLVMIRCodeGen/BundleSaver.h"
+#include "glow/LLVMIRCodeGen/CommandLine.h"
 #include "glow/LLVMIRCodeGen/LLVMBackend.h"
 
 #include "glow/Graph/Graph.h"
 #include "glow/Graph/PlaceholderBindings.h"
 #include "glow/IR/Instrs.h"
+#include "glow/IR/LLVMAPIMacros.h"
 #include "glow/Support/Debug.h"
 
 #include "llvm/ADT/SmallVector.h"
@@ -175,7 +175,7 @@ BundleSaver::BundleSaver(const LLVMBackend &llvmBackend,
       bundleAPI_(llvmBackend.getOptions().getBundleAPI()) {
   llvm::SmallVector<std::string, 8> targetFeatures(llvmTargetFeatures.begin(),
                                                    llvmTargetFeatures.end());
-  irgen_->setBundleName(bundleName);
+  irgen_->setBundleName(bundleName.str());
   irgen_->setOutputDir(outputDir);
   irgen_->setObjectRegistry(llvmBackend.getObjectRegistry());
   // Use the bundle code model as a code model for the TargetMachine.
@@ -189,7 +189,7 @@ void BundleSaver::setIRFunction(llvm::StringRef mainEntryName,
                                 const IRFunction *F) {
   irgen_->setIRFunction(F);
   if (F) {
-    savedIRFunctions_.push_back(SavedIRFunction{mainEntryName, F});
+    savedIRFunctions_.push_back(SavedIRFunction{mainEntryName.str(), F});
   }
 }
 
@@ -279,6 +279,9 @@ void BundleSaver::saveHeader(llvm::StringRef headerFileName) {
   auto constMemSize = irgen_->getAllocationsInfo().constantWeightVarsMemSize_;
   auto mutableMemSize = irgen_->getAllocationsInfo().mutableWeightVarsMemSize_;
   auto activationsMemSize = irgen_->getAllocationsInfo().activationsMemSize_;
+  auto activationsMemAllocEff = irgen_->getAllocationsInfo()
+                                    .getActivationsAllocator()
+                                    .getAllocationEfficiency();
   auto memAlignSize = TensorAlignment;
   auto totMemSize = constMemSize + mutableMemSize + activationsMemSize;
 
@@ -288,9 +291,11 @@ void BundleSaver::saveHeader(llvm::StringRef headerFileName) {
                            : staticApiCommonDefines;
 
   // Format model description.
-  std::string modelInfo = strFormat("// Model name: \"%s\"\n"
-                                    "// Total data size: %lu (bytes)\n",
-                                    bundleName.data(), totMemSize);
+  std::string modelInfo =
+      strFormat("// Model name: \"%s\"\n"
+                "// Total data size: %lu (bytes)\n"
+                "// Activations allocation efficiency: %.4f\n",
+                bundleName.data(), totMemSize, activationsMemAllocEff);
   // Print placeholders (mandatory).
   modelInfo += "// Placeholders:\n";
   auto placeholders = findPlaceholders();
@@ -417,9 +422,13 @@ void BundleSaver::emitSymbolTable() {
   auto *charTy = llvm::Type::getInt8Ty(irgen_->getLLVMContext());
   auto *uint64TTy =
       llvm::Type::getIntNTy(irgen_->getLLVMContext(), sizeof(uint64_t) * 8);
-  auto symbolTableEntryTy = llvm::StructType::get(
-      irgen_->getLLVMContext(),
-      {charTy->getPointerTo(), uint64TTy, uint64TTy, charTy});
+  auto symbolTableEntryTy =
+      GET_TYPE_BY_NAME(irgen_->getModule(), "struct.SymbolTableEntry");
+  if (!symbolTableEntryTy) {
+    symbolTableEntryTy = llvm::StructType::get(
+        irgen_->getLLVMContext(),
+        {charTy->getPointerTo(), uint64TTy, uint64TTy, charTy});
+  }
   // Set of entries in the symbol table.
   llvm::SmallVector<llvm::Constant *, 128> entries;
   // Iterate over all Placeholders and record information about their names,
@@ -447,7 +456,6 @@ void BundleSaver::emitSymbolTable() {
   // Create a constant array with these entries.
   auto *arr = llvm::ConstantArray::get(
       llvm::ArrayType::get(symbolTableEntryTy, entries.size()), entries);
-  // Create a global variable and initialize it with the constructed array.
   new llvm::GlobalVariable(irgen_->getModule(), arr->getType(), true,
                            llvm::GlobalValue::InternalLinkage, arr,
                            irgen_->getBundleName() + "SymbolTable");
@@ -536,19 +544,24 @@ void BundleSaver::produceBundle() {
   auto &M = irgen_->getModule();
   auto outputDir = irgen_->getOutputDir();
   auto bundleName = irgen_->getBundleName();
+  auto savedBundleName = irgen_->getSavedBundleName().empty()
+                             ? bundleName
+                             : irgen_->getSavedBundleName();
   std::string extension = (llvmCompiler.empty()) ? ".o" : ".bc";
-  auto bundleCodeOutput = (outputDir + "/" + bundleName + extension).str();
+  std::string bundleCodeOutput;
+  bundleCodeOutput = (outputDir + "/" + savedBundleName + extension).str();
   auto bundleWeightsBinOut =
-      (outputDir + "/" + bundleName + ".weights.bin").str();
-  auto bundleHeaderOutput = (outputDir + "/" + bundleName + ".h").str();
+      (outputDir + "/" + savedBundleName + ".weights.bin").str();
+  auto bundleHeaderOutput = (outputDir + "/" + savedBundleName + ".h").str();
   DEBUG_GLOW(llvm::dbgs() << "Producing a bundle:\n"
+                          << "saved bundle name: " << savedBundleName << "\n"
                           << "bundle name: " << bundleName << "\n"
                           << "bundle code: " << bundleCodeOutput << "\n"
                           << "bundle weights:" << bundleWeightsBinOut << "\n"
                           << "header file: " << bundleHeaderOutput << "\n");
   llvm::StringRef fileName = bundleCodeOutput;
   std::error_code EC;
-  llvm::raw_fd_ostream outputFile(fileName, EC, llvm::sys::fs::F_None);
+  llvm::raw_fd_ostream outputFile(fileName, EC, llvm::sys::fs::OF_None);
   CHECK(!EC) << "Could not open the output file for saving the bundle "
                 "code with file name: "
              << fileName.str();
@@ -568,10 +581,10 @@ void BundleSaver::produceBundle() {
       if (!llvmOpt.empty()) {
         bundleObjectCodeOutputOpt =
             " -emit-llvm -o " +
-            (outputDir + "/" + bundleName + ".beforeopt.bc").str();
+            (outputDir + "/" + savedBundleName + ".beforeopt.bc").str();
       } else {
         bundleObjectCodeOutputOpt =
-            " -o " + (outputDir + "/" + bundleName + ".o").str();
+            " -o " + (outputDir + "/" + savedBundleName + ".o").str();
       }
 
       cmd += bundleObjectCodeOutputOpt;
@@ -583,18 +596,32 @@ void BundleSaver::produceBundle() {
       if (!llvmOpt.empty()) {
         cmd.clear();
         cmd = llvmOpt;
-        cmd += " " + (outputDir + "/" + bundleName + ".beforeopt.bc").str();
-        cmd += " -O3 -o " + (outputDir + "/" + bundleName + ".opt.bc").str();
+        cmd +=
+            " " + (outputDir + "/" + savedBundleName + ".beforeopt.bc").str();
+        cmd +=
+            " -O3 -o " + (outputDir + "/" + savedBundleName + ".opt.bc").str();
         CHECK(!system(cmd.c_str()))
             << "Error running external opt compiler: " << cmd;
+
+        if (llvmSaveAsm) {
+          cmd.clear();
+          cmd = llvmCompiler;
+          for (auto option : llvmCompilerOptions) {
+            cmd += " " + option + " ";
+          }
+          cmd += " " + (outputDir + "/" + savedBundleName + ".opt.bc").str();
+          cmd += " -S -o " + (outputDir + "/" + savedBundleName + ".s").str();
+          CHECK(!system(cmd.c_str()))
+              << "Error running external LLVM compiler: " << cmd;
+        }
 
         cmd.clear();
         cmd = llvmCompiler;
         for (auto option : llvmCompilerOptions) {
           cmd += " " + option + " ";
         }
-        cmd += " " + (outputDir + "/" + bundleName + ".opt.bc").str();
-        cmd += " -o " + (outputDir + "/" + bundleName + ".o").str();
+        cmd += " " + (outputDir + "/" + savedBundleName + ".opt.bc").str();
+        cmd += " -o " + (outputDir + "/" + savedBundleName + ".o").str();
         CHECK(!system(cmd.c_str()))
             << "Error running external LLVM compiler: " << cmd;
       }
@@ -603,6 +630,32 @@ void BundleSaver::produceBundle() {
     // Emit the object file.
     llvm::legacy::PassManager PM;
     auto &TM = irgen_->getTargetMachine();
+
+    // Create asm output file.
+    if (llvmSaveAsm) {
+      auto asm_FileName = (outputDir + "/" + savedBundleName + ".s").str();
+      llvm::StringRef asmFileName = asm_FileName;
+      std::error_code EC2;
+      llvm::raw_fd_ostream outputFileAsm(asmFileName, EC2,
+                                         llvm::sys::fs::OF_None);
+      CHECK(!EC2) << "Could not open the output file for saving the asm "
+                     "code with file name: "
+                  << asmFileName.str();
+      llvm::legacy::PassManager PM2;
+#if FACEBOOK_INTERNAL && LLVM_VERSION_MAJOR < 8
+      TM.addPassesToEmitFile(
+          PM2, outputFileAsm,
+          llvm::TargetMachine::CodeGenFileType::CGFT_AssemblyFile);
+#elif LLVM_VERSION_MAJOR < 10
+      TM.addPassesToEmitFile(
+          PM2, outputFileAsm, nullptr,
+          llvm::TargetMachine::CodeGenFileType::CGFT_AssemblyFile);
+#else
+      TM.addPassesToEmitFile(PM2, outputFileAsm, nullptr,
+                             llvm::CGFT_AssemblyFile);
+#endif
+      PM2.run(M);
+    }
 
 #if FACEBOOK_INTERNAL && LLVM_VERSION_MAJOR < 8
     TM.addPassesToEmitFile(
@@ -614,7 +667,6 @@ void BundleSaver::produceBundle() {
 #else
     TM.addPassesToEmitFile(PM, outputFile, nullptr, llvm::CGFT_ObjectFile);
 #endif
-
     PM.run(M);
   }
   outputFile.close();
@@ -622,14 +674,20 @@ void BundleSaver::produceBundle() {
   createBundleArchive(fileName, irgen_->getObjectRegistry(),
                       irgen_->getBundleObjects());
   // Output weights.
-  saveWeights(bundleWeightsBinOut);
+  if (saveWeights_) {
+    saveWeights(bundleWeightsBinOut);
+  }
   // Header file.
-  saveHeader(bundleHeaderOutput);
+  if (saveHeader_) {
+    saveHeader(bundleHeaderOutput);
+  }
   // Save weights also in text format for Static API.
-  if (bundleAPI_ == BundleApiType::Static) {
-    auto bundleWeightsTxtOut =
-        (outputDir + "/" + bundleName + ".weights.txt").str();
-    serializeBinaryToText(bundleWeightsBinOut, bundleWeightsTxtOut);
+  if (saveWeightsAsText_) {
+    if (bundleAPI_ == BundleApiType::Static) {
+      auto bundleWeightsTxtOut =
+          (outputDir + "/" + savedBundleName + ".weights.txt").str();
+      serializeBinaryToText(bundleWeightsBinOut, bundleWeightsTxtOut);
+    }
   }
 }
 
@@ -641,18 +699,23 @@ void BundleSaver::produceBundle() {
 /// absolute addressing whenever possible.
 void BundleSaver::emitBundleEntryFunction(
     BundleSaver::SavedIRFunction &savedF) {
-  // The bundle entry point has the following API:
-  // int entry(uint8_t *constantWeight,
-  //           uint8_t *mutableWeight,
-  //           uint8_t *activations);
-  auto int8PtrTy = llvm::Type::getInt8PtrTy(irgen_->getLLVMContext());
-  llvm::Type *retTy = llvm::Type::getIntNTy(irgen_->getLLVMContext(),
-                                            irgen_->getLibjitIntWidth());
-  llvm::FunctionType *bundleFuncTy =
-      llvm::FunctionType::get(retTy, {int8PtrTy, int8PtrTy, int8PtrTy}, false);
-  auto *func =
-      llvm::Function::Create(bundleFuncTy, llvm::Function::ExternalLinkage,
-                             savedF.entryName, &irgen_->getModule());
+  auto *func = irgen_->getModule().getFunction(savedF.entryName);
+  if (!func) {
+    // The bundle entry point has the following API:
+    // int entry(uint8_t *constantWeight,
+    //           uint8_t *mutableWeight,
+    //           uint8_t *activations);
+    auto int8PtrTy = llvm::Type::getInt8PtrTy(irgen_->getLLVMContext());
+    llvm::Type *retTy = llvm::Type::getIntNTy(irgen_->getLLVMContext(),
+                                              irgen_->getLibjitIntWidth());
+    llvm::FunctionType *bundleFuncTy = llvm::FunctionType::get(
+        retTy, {int8PtrTy, int8PtrTy, int8PtrTy}, false);
+    func = llvm::Function::Create(bundleFuncTy, llvm::Function::ExternalLinkage,
+                                  savedF.entryName, &irgen_->getModule());
+  }
+  CHECK(func->isDeclaration()) << "Function definition of " << savedF.entryName
+                               << " already exists in the LLVM module";
+
   llvm::BasicBlock *entry_bb =
       llvm::BasicBlock::Create(irgen_->getLLVMContext(), "entry", func);
   llvm::IRBuilder<> builder(entry_bb);
@@ -707,10 +770,32 @@ void BundleSaver::emitBundleConfig() {
       llvm::StructType::get(irgen_->getLLVMContext(),
                             {uint64TType, uint64TType, uint64TType, uint64TType,
                              uint64TType, symbolTableEntryTy->getPointerTo()});
-  auto config = new llvm::GlobalVariable(
-      irgen_->getModule(), bundleConfigTy, /* isConst */ true,
-      llvm::GlobalValue::LinkageTypes::ExternalLinkage, nullptr,
+  // Checking if LLVM module already has <bundle>_config otherwise creating new.
+  auto config = irgen_->getModule().getGlobalVariable(
       irgen_->getBundleName().str() + "_config");
+  if (!config) {
+    config = new llvm::GlobalVariable(
+        irgen_->getModule(), bundleConfigTy, /* isConst */ true,
+        llvm::GlobalValue::LinkageTypes::ExternalLinkage, nullptr,
+        irgen_->getBundleName().str() + "_config");
+  } else {
+    bundleConfigTy = llvm::dyn_cast<llvm::StructType>(
+        config->getType()->getPointerElementType());
+  }
+
+  // If symbolTable is not the same type as bundleConfig struct's symbolTable
+  // member, bitcast the pointer to the appropriate type.
+  llvm::Constant *symbolTableTyped = symbolTable;
+  llvm::Type *configSymbolTableType =
+      config->getValueType()->getStructElementType(5);
+  if (symbolTableEntryTy->getPointerTo() != configSymbolTableType) {
+    symbolTableTyped = llvm::ConstantExpr::getPointerCast(
+        symbolTable, config->getValueType()->getStructElementType(5));
+  }
+
+  CHECK(!config->hasInitializer())
+      << "Bundle config has already been initialized";
+
   config->setInitializer(llvm::ConstantStruct::get(
       bundleConfigTy,
       llvm::ConstantInt::get(
@@ -719,11 +804,9 @@ void BundleSaver::emitBundleConfig() {
           uint64TType, irgen_->getAllocationsInfo().mutableWeightVarsMemSize_),
       llvm::ConstantInt::get(uint64TType,
                              irgen_->getAllocationsInfo().activationsMemSize_),
-
       llvm::ConstantInt::get(uint64TType, TensorAlignment),
       llvm::ConstantInt::get(uint64TType, findPlaceholders().size()),
-
-      symbolTable));
+      symbolTableTyped));
 }
 
 void BundleSaver::performBundleMemoryAllocation() {
@@ -739,7 +822,7 @@ void BundleSaver::performBundleMemoryAllocation() {
 
 void BundleSaver::save(llvm::StringRef mainEntryName, const IRFunction *F) {
   // Object files generation works properly only in small mode.
-  irgen_->setMainEntryName(mainEntryName);
+  irgen_->setMainEntryName(mainEntryName.str());
   // Set current IRFunction using the legalized name.
   setIRFunction(irgen_->getMainEntryName(), F);
   // irgen_->initCodeGen();

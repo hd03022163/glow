@@ -100,13 +100,19 @@ createDefaultGraphOptimizationPassPipeline() {
       {FunctionPassID::OptimizeSmallConv},
 
       // Merge multiple matmul nodes into a single large matmul.
-      {FunctionPassID::MergeMatMul},
-
+      {FunctionPassID::MergeMatMulOnLHS},
+      {FunctionPassID::MergeMatMulOnRHS},
       // Merge multiple batched adds into a larger batched add.
       {FunctionPassID::MergeBatchedAdd},
 
       // Merge ReduceMean into AveragePool if possible.
       {FunctionPassID::OptimizeReduceMean},
+
+      // Optimize Resize nodes.
+      {FunctionPassID::OptimizeResize},
+
+      // Optimize Insert nodes.
+      {FunctionPassID::OptimizeInsert},
 
       // Convert BatchMatMuls with a broadcasted RHS to a single MatMul.
       {FunctionPassID::ConvertBroadcastedBatchMatMul},
@@ -167,6 +173,10 @@ createDefaultGraphOptimizationPassPipeline() {
       // Optimize combinations of Quantized Nodes and Clips.
       {FunctionPassID::OptimizeQuantizeClip},
 
+      // Remove identity Relu and Clip nodes.
+      {FunctionPassID::RemoveIdentityRelu},
+      {FunctionPassID::RemoveIdentityClip},
+
       // Fold a Convolution dilated manually using Transpose, SpaceToDepth and
       // DepthToSpace nodes into a single Convolution node.
       // Run Reshape/Transpose optimizations afterwards to clean up the graph.
@@ -201,6 +211,14 @@ createDefaultGraphOptimizationPassPipeline() {
       // node does not get optimized out (e.g. sinking of Transpose below Tile).
       // Run code hoisting pass to undo such unsuccessful sinking.
       {FunctionPassID::HoistCode, ConvergenceMode::UntilFixedPoint},
+
+      // Try to eliminate Reshape nodes by sinking them through the graph.
+      // Such sinking can create new optimization opportunities as well as
+      // prevent some optimizations from happening, so do it at the very end of
+      // the pipeline to keep the current iteration unaffected and bear all
+      // benefits/consequences on the next pipeline iteration.
+      {FunctionPassID::SinkReshapes, ConvergenceMode::UntilFixedPoint},
+      {FunctionPassID::OptimizeReshape},
 
       // Perform a round of Dead Code Elimination to cleanup the final pass.
       getDCEPassConfig(),

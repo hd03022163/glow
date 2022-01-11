@@ -505,6 +505,18 @@ int main(int argc, char **argv) {
                   {"Lengths", "ElemKind::Int32ITy"})
       .autoVerify(VerifyKind::SameShape, {"Weights", "Indices"});
 
+  BB.newInstr("FusedRowwiseQuantizedSparseLengthsSum")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Data", OperandKind::In)
+      .addOperand("Indices", OperandKind::In)
+      .addOperand("Lengths", OperandKind::In)
+      .addMember(MemberType::Boolean, "UseFP16Accumulation")
+      .addMember(MEMBER_TYPE_INFO(glow::LengthsMode), "LengthsMode")
+      .addMember(MemberType::Float, "AvgLength")
+      .autoIRGen()
+      .autoVerify(VerifyKind::SameElementType,
+                  {"Lengths", "ElemKind::Int32ITy"});
+
   BB.newInstr("EmbeddingBagByteRowwiseOffsets")
       .addOperand("Dest", OperandKind::Out)
       .addOperand("Data", OperandKind::In)
@@ -538,12 +550,21 @@ int main(int argc, char **argv) {
       .autoVerify(VerifyKind::SameElementType,
                   {"Lengths", "ElemKind::Int32ITy"});
 
-  /// Converts the given sparse representation into a dense one.
-  BB.newInstr("SparseToDense")
+  BB.newInstr("BatchSparseToDense")
       .addOperand("Dest", OperandKind::Out)
+      .addOperand("Lengths", OperandKind::In)
       .addOperand("Indices", OperandKind::In)
       .addOperand("Values", OperandKind::In)
+      .addMember(MemberType::Float, "DefaultValue")
+      .addMember(MemberType::Unsigned, "DenseLastDim")
       .autoVerify(VerifyKind::SameElementType, {"Dest", "Values"})
+      .autoIRGen();
+
+  BB.newInstr("FillExamplesWithIndicator")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Data", OperandKind::In)
+      .addOperand("Indicator", OperandKind::In)
+      .autoVerify(VerifyKind::SameElementType, {"Dest", "Data"})
       .autoIRGen();
 
   BB.newInstr("SparseToDenseMask")
@@ -983,6 +1004,61 @@ int main(int argc, char **argv) {
       .addMember(MemberType::Unsigned, "VectorSize")
       .autoVerify(VerifyKind::NoVerify);
 
+  BB.newInstr("BatchedUnaryEmbeddingsBags")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Weights", OperandKind::In)
+      .addOperand("TableOffsets", OperandKind::In)
+      .addOperand("Offsets", OperandKind::In)
+      .addOperand("Indices", OperandKind::In)
+      .autoIRGen()
+      .autoVerify(VerifyKind::SameElementType,
+                  {"TableOffsets", "Indices", "Offsets"})
+      .autoVerify(VerifyKind::SameElementType,
+                  {"Indices", "ElemKind::Int32ITy"})
+      .autoVerify(VerifyKind::SameElementType,
+                  {"Offsets", "ElemKind::Int32ITy"});
+
+  BB.newInstr("IntNBitSplitEmbeddingBags")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("DevWeights", OperandKind::In)
+      .addOperand("UvmWeights", OperandKind::In)
+      .addOperand("WeightsPlacements", OperandKind::In)
+      .addOperand("WeightsOffsets", OperandKind::In)
+      .addOperand("WeightsTys", OperandKind::In)
+      .addOperand("DimOffsets", OperandKind::In)
+      .addOperand("Indices", OperandKind::In)
+      .addOperand("Offsets", OperandKind::In)
+      .addMember(MemberType::Int64, "TotalDims")
+      .addMember(MEMBER_TYPE_INFO(glow::SplitEmbeddingPoolingMode),
+                 "PoolingMode")
+      .addMember(MEMBER_TYPE_INFO(glow::SplitEmbeddingSparseType),
+                 "OutputDType")
+      .autoIRGen()
+      .autoVerify(VerifyKind::SameElementType,
+                  {"Indices", "ElemKind::Int32ITy"})
+      .autoVerify(VerifyKind::SameElementType,
+                  {"Offsets", "ElemKind::Int32ITy"});
+
+  BB.newInstr("IntNBitSplitEmbeddingWeightedBags")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("DevWeights", OperandKind::In)
+      .addOperand("UvmWeights", OperandKind::In)
+      .addOperand("WeightsPlacements", OperandKind::In)
+      .addOperand("WeightsOffsets", OperandKind::In)
+      .addOperand("WeightsTys", OperandKind::In)
+      .addOperand("DimOffsets", OperandKind::In)
+      .addOperand("Indices", OperandKind::In)
+      .addOperand("Offsets", OperandKind::In)
+      .addOperand("IndiceWeight", OperandKind::In)
+      .addMember(MemberType::Int64, "TotalDims")
+      .addMember(MemberType::Int64, "PoolingMode")
+      .addMember(MemberType::Int64, "OutputDType")
+      .autoIRGen()
+      .autoVerify(VerifyKind::SameElementType,
+                  {"Indices", "ElemKind::Int32ITy"})
+      .autoVerify(VerifyKind::SameElementType,
+                  {"Offsets", "ElemKind::Int32ITy"});
+
   //===--------------------------------------------------------------------===//
   //                Fillers
   //===--------------------------------------------------------------------===//
@@ -1081,6 +1157,14 @@ int main(int argc, char **argv) {
       .autoVerify(VerifyKind::SameElementType, {"Dest", "Src"})
       .autoIRGen();
 
+  /// Input(s) will be added in backend specific function
+  /// (Backend::generateInst()) when the concat node is not lowered into a list
+  //  of inserttensor.
+  BB.newInstr("Concat")
+      .addOperand("Dest", OperandKind::Out)
+      .addMember(MemberType::Unsigned, "Axis")
+      .autoVerify(VerifyKind::NoVerify);
+
   BB.newInstr("Splat")
       .addMember(MemberType::Float, "Value")
       .addOperand("Dest", OperandKind::Out)
@@ -1106,6 +1190,12 @@ int main(int argc, char **argv) {
       .addOperand("Src", OperandKind::In)
       .addMember(MemberType::VectorDimT, "Offsets");
 
+  // TODO: Rename "BatchDims" member to "Axis". This was attempted in #5565 but
+  // some internal FB tests failed. The member needs to be renamed because that
+  // is the true meaning of the member and that is what the implementation does
+  // according to both Caffe2, ONNX and TFLite operator definitions.
+  // https://github.com/onnx/onnx/blob/master/docs/Operators.md#gather
+  // https://www.tensorflow.org/mlir/tfl_ops#tflgather_tflgatherop
   BB.newInstr("Gather")
       .addOperand("Dest", OperandKind::Out)
       .addOperand("Data", OperandKind::In)
@@ -1118,6 +1208,7 @@ int main(int argc, char **argv) {
       .addOperand("Dest", OperandKind::Out)
       .addOperand("Data", OperandKind::In)
       .addOperand("Indices", OperandKind::In)
+      .addMember(MemberType::Unsigned, "BatchDims")
       .autoVerify(VerifyKind::SameElementType, {"Dest", "Data"})
       .autoIRGen();
 
@@ -1364,6 +1455,29 @@ int main(int argc, char **argv) {
       .autoVerify(VerifyKind::SameElementType, {"Boxes", "Scores"})
       .autoVerify(VerifyKind::SameElementType,
                   {"Indices", "NumberOfSelectedIndices"})
+      .autoIRGen();
+
+  BB.newInstr("TFLiteDetectionPostProcess")
+      .addOperand("DetectionBoxes", OperandKind::Out)
+      .addOperand("DetectionClasses", OperandKind::Out)
+      .addOperand("DetectionScores", OperandKind::Out)
+      .addOperand("NumDetections", OperandKind::Out)
+      .addOperand("Boxes", OperandKind::In)
+      .addOperand("Scores", OperandKind::In)
+      .addOperand("Anchors", OperandKind::In)
+      .addOperand("Scratch", OperandKind::Scratch)
+      .addMember(MemberType::Unsigned, "NumClasses")
+      .addMember(MemberType::Unsigned, "MaxDetections")
+      .addMember(MemberType::Unsigned, "MaxClassesPerDetection")
+      .addMember(MemberType::Unsigned, "MaxDetectionsPerClass")
+      .addMember(MemberType::Float, "IouThreshold")
+      .addMember(MemberType::Float, "ScoreThreshold")
+      .addMember(MemberType::Float, "XScale")
+      .addMember(MemberType::Float, "YScale")
+      .addMember(MemberType::Float, "HScale")
+      .addMember(MemberType::Float, "WScale")
+      .addMember(MemberType::Boolean, "RegularNMS")
+      .autoVerify(VerifyKind::NoVerify)
       .autoIRGen();
 
   //===--------------------------------------------------------------------===//

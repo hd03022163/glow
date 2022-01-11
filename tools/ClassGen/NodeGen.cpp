@@ -294,6 +294,17 @@ int main(int argc, char **argv) {
                     "Momentum. Similar to Caffe2 SpatialBN, and ONNX "
                     "BatchNormalization operator.");
 
+  BB.newNode("InstanceNormalization")
+      .addInput("Input")
+      .addInput("Scale")
+      .addInput("Bias")
+      .addMember(MemberType::Unsigned, "ChannelIdx")
+      .addMember(MemberType::Float, "Epsilon")
+      .addResult("Input.getType()")
+      .setDocstring("Performs instance normalization on the Input tensor with "
+                    "the provided Scale, Bias, Epsilon. Similar to ONNX "
+                    "InstanceNormalization operator.");
+
   BB.newNode("MeanVarNormalization")
       .addInput("Input")
       .addInput("Mean")
@@ -962,18 +973,29 @@ int main(int argc, char **argv) {
       .setDocstring(
           "Converts an input Lengths 1D vector into a range sequence.");
 
-  BB.newNode("SparseToDense")
+  BB.newNode("BatchSparseToDense")
+      .addInput("Lengths")
       .addInput("Indices")
       .addInput("Values")
+      .addMember(MemberType::Float, "DefaultValue")
+      .addMember(MemberType::Unsigned, "DenseLastDim")
       .addResultFromCtorArg()
       .setDocstring(
-          "Converts the sparse representation specified by the pair "
-          "(Indices, Values) into a dense one. This dense "
-          "representation contains each value from Values at the "
-          "corresponding index specified in Indices. Unspecified indices "
-          "are filled with zeroes. Indices may contain duplicate values "
-          "and in this case, all of the corresponding values in Values "
-          "are added together.");
+          "Converts the sparse representation specified by "
+          "(Lengths, Indices, Values) into a dense one. In the dense "
+          "representation, elements of the lengths vector represent the number "
+          "of indices in the corresponding batch, where each batch "
+          "contains each value from Values at the "
+          "corresponding index specified in Indices, and is filled with "
+          "DefaultValue otherwise. Within each batch, Indices shouldn't "
+          "contain duplicate indices.");
+
+  BB.newNode("FillExamplesWithIndicator")
+      .addInput("Data")
+      .addInput("Indicator")
+      .addResultFromCtorArg()
+      .setDocstring("Inserts zeros into data along axis=0 for indices where "
+                    "indicator is zero.");
 
   BB.newNode("SparseToDenseMask")
       .addInput("Indices")
@@ -1028,6 +1050,52 @@ int main(int argc, char **argv) {
       .addMember(MemberType::VectorNodeValue, "OriginalInputs")
       .setDocstring(
           "Performs the gradient operation for BatchedPairwiseDotProduct");
+
+  BB.newNode("BatchedUnaryEmbeddingsBags")
+      .addInput("Weights")
+      .addInput("TableOffsets")
+      .addInput("Offsets")
+      .addInput("Indices")
+      .addResultFromCtorArg()
+      .setDocstring("Sum weight embeddings according to offsets and indices");
+
+  BB.newNode("IntNBitSplitEmbeddingBags")
+      .addInput("DevWeights")
+      .addInput("UvmWeights")
+      .addInput("WeightsPlacements")
+      .addInput("WeightsOffsets")
+      .addInput("WeightsTys")
+      .addInput("DimOffsets")
+      .addInput("Indices")
+      .addInput("Offsets")
+      .addMember(MemberType::Int64, "TotalDims")
+      .addMember(MEMBER_TYPE_INFO(glow::SplitEmbeddingPoolingMode),
+                 "PoolingMode")
+      .addMember(MEMBER_TYPE_INFO(glow::SplitEmbeddingSparseType),
+                 "OutputDType")
+      .addResultFromCtorArg()
+      .setDocstring("Table based batched embeddingbags with quantization "
+                    "support. Experimental only and subject to change.");
+
+  BB.newNode("IntNBitSplitEmbeddingWeightedBags")
+      .addInput("DevWeights")
+      .addInput("UvmWeights")
+      .addInput("WeightsPlacements")
+      .addInput("WeightsOffsets")
+      .addInput("WeightsTys")
+      .addInput("DimOffsets")
+      .addInput("Indices")
+      .addInput("Offsets")
+      .addInput("IndiceWeight")
+      .addMember(MemberType::Int64, "TotalDims")
+      .addMember(MEMBER_TYPE_INFO(glow::SplitEmbeddingPoolingMode),
+                 "PoolingMode")
+      .addMember(MEMBER_TYPE_INFO(glow::SplitEmbeddingSparseType),
+                 "OutputDType")
+      .addResultFromCtorArg()
+      .setDocstring(
+          "Table based batched embeddingbags with quantization support and "
+          "indice weights. Experimental only and subject to change.");
 
   //===--------------------------------------------------------------------===//
   //                Fillers
@@ -1170,6 +1238,12 @@ int main(int argc, char **argv) {
                     "Small is inserted Count times along Axis. The resulting "
                     "Tensor will have the same type as the input Big tensor.");
 
+  // TODO: Rename "BatchDims" member to "Axis". This was attempted in #5565 but
+  // some internal FB tests failed. The member needs to be renamed because that
+  // is the true meaning of the member and that is what the implementation does
+  // according to both Caffe2, ONNX and TFLite operator definitions.
+  // https://github.com/onnx/onnx/blob/master/docs/Operators.md#gather
+  // https://www.tensorflow.org/mlir/tfl_ops#tflgather_tflgatherop
   BB.newNode("Gather")
       .addInput("Data")
       .addInput("Indices")
@@ -1179,14 +1253,15 @@ int main(int argc, char **argv) {
                     "indexed by Indices, and concatenates them. Output tensor "
                     "will have dimensions: {I_0, I_1, ... I_n, D_1, D_2, ... "
                     "D_m}, where D_i and I_j denote Data and Indices "
-                    "dimensions respectively. If batchDims is not zero, the "
-                    "gather operator will treat the first batchDims as the "
+                    "dimensions respectively. If axis is not zero, the "
+                    "gather operator will treat the first axis as the "
                     "batch and will concat the result of the gather operation "
                     "on each sample in the batch.");
 
   BB.newNode("GatherND")
       .addInput("Data")
       .addInput("Indices")
+      .addMember(MemberType::Unsigned, "BatchDims")
       .addResultFromCtorArg()
       .setDocstring(
           "Given Data tensor of rank r >= 1, Indices tensor of rank q >= 1 "
@@ -1561,6 +1636,51 @@ int main(int argc, char **argv) {
                     "classes and does per class NMS. It also supports TF NMS "
                     "V4 by outputting indices and scalar tensor with number of "
                     "valid indices. It pads the rest with global MIN box.");
+
+  BB.newNode("TFLiteDetectionPostProcess")
+      .addInput("Boxes")
+      .addInput("Scores")
+      .addInput("Anchors")
+      .addMember(MemberType::Unsigned, "NumClasses")
+      .addMember(MemberType::Unsigned, "MaxDetections")
+      .addMember(MemberType::Unsigned, "MaxClassesPerDetection")
+      .addMember(MemberType::Unsigned, "MaxDetectionsPerClass")
+      .addMember(MemberType::Float, "IouThreshold")
+      .addMember(MemberType::Float, "ScoreThreshold")
+      .addMember(MemberType::Float, "XScale")
+      .addMember(MemberType::Float, "YScale")
+      .addMember(MemberType::Float, "HScale")
+      .addMember(MemberType::Float, "WScale")
+      .addMember(MemberType::Boolean, "RegularNMS")
+      .addResultFromCtorArg("DetectionBoxes")
+      .addResultFromCtorArg("DetectionClasses")
+      .addResultFromCtorArg("DetectionScores")
+      .addResultFromCtorArg("NumDetections")
+      .setDocstring(
+          "This node is a TensorFlowLite version of NonMaxSuppresion. The node "
+          "has the following inputs: Boxes with size [N, B, 4], Scores with "
+          "size [N, B, C] and Anchors with size [B, 4] where N is the batch "
+          "size, B is the number of boxes and C is the number of classes. "
+          "The node has the following attributes (parameters): "
+          "NumClasses - Number of classes (without the background class). "
+          "MaxDetections - The maximum number of detections. "
+          "MaxClassesPerDetection - Maximum classes per detection (Fast NMS). "
+          "MaxDetectionsPerClass - Maximum detections per class (Regular NMS). "
+          "IouThreshold - Detection threshold for IoU metric. "
+          "ScoreThreshold - Detection threshold for scores. "
+          "XScale - X scale used for decoding the boxes. "
+          "YScale - Y scale used for decoding the boxes. "
+          "HScale - H scale used for decoding the boxes. "
+          "WScale - W scale used for decoding the boxes. "
+          "RegularNMS - Whether the NMS is 'Regular' or 'Fast'. "
+          "The node will have the following outputs: "
+          "DetectionBoxes - the chosen boxes (float). "
+          "DetectionClasses - the classes of the chosen boxes (int32). "
+          "DetectionScores - the scores of the chosen boxes (float). "
+          "NumDetections - number of chose boxes (int32). "
+          "The first three output tensors will be allocated using the maximum "
+          "number of possible detections (worst case scenario) but the actual "
+          "usage will be given by the 'NumDetections' output. ");
 
   //===--------------------------------------------------------------------===//
   //                Region of Interest nodes

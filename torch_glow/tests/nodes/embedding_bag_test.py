@@ -1,3 +1,17 @@
+# Copyright (c) Glow Contributors. See CONTRIBUTORS file.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 import numpy as np
@@ -42,7 +56,8 @@ class TestQuantizedEmbeddingBag(utils.TorchGlowTestCase):
 
     @utils.deterministic_expand(
         [
-            lambda: (
+            # explicit local param declaration required for lambda fn with loops for correct param generation
+            lambda num_lengths=num_lengths, is4bit=is4bit, is_weighted=is_weighted, use_fp16=use_fp16, per_sample_weights_fp16=per_sample_weights_fp16: (
                 "{len}{bits}{weighted}{fp16}{sample_weights}{backend}".format(
                     len=num_lengths,
                     bits="_4bit" if is4bit else "_byte",

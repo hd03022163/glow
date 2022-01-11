@@ -76,8 +76,20 @@ Error NNPICompiledFunction::updateCompilationConfigFromOptions(
   }
 
   if (dspKernelsFile.empty() && requiresDSPKernels) {
-    return MAKE_ERR("DSP kernels file not found, needed to run Function "
-                    "containing DSP kernels");
+    // If kernels file was not provided then check if pointer to lib content
+    // was provided in compilation options.
+    if (compilationOptions.customDspKernelsSize) {
+      config_.sizeCustomDspLib = compilationOptions.customDspKernelsSize.get();
+      config_.customDspLib = reinterpret_cast<uint8_t *>(
+          compilationOptions.customDspKernelsLibPtr.get());
+      LOG(INFO) << "Loading DSP library from NNPICompilationOptions with size "
+                << compilationOptions.customDspKernelsSize;
+    } else {
+      return MAKE_ERR(
+          "Neither DSP kernels file found, nor pointer to lib provided."
+          "Atleast one of them is needed to run function containing DSP "
+          "kernels");
+    }
   } else {
     std::strncpy(config_.customDspKernelsFile, dspKernelsFile.c_str(),
                  dspKernelsFile.size());
@@ -114,8 +126,17 @@ Error NNPICompiledFunction::updateCompilationConfigFromOptions(
   config_.enableLayerSplitter = compilationOptions.enableLayerSplitter;
   config_.enableConvSpatialSplitter =
       compilationOptions.enableConvSpatialSplitter;
+  config_.enableConvBatchSplitter = compilationOptions.enableConvBatchSplitter;
+  config_.disableWeightsInPool = compilationOptions.disableWeightsInPool;
 #endif
 
+#if NNPI_MAJOR_VERSION >= 1 && NNPI_MINOR_VERSION >= 7
+  config_.dumpIntermediate = compilationOptions.dumpIntermediate;
+  config_.numParallelDeciderCompilation =
+      compilationOptions.numDeciderCompilation;
+  config_.weightsThresholdForWeightSharing =
+      compilationOptions.thresholdDisableWeightsPool;
+#endif // NNPI >= 1.7
   return Error::success();
 }
 
@@ -232,7 +253,8 @@ Error NNPICompiledFunction::setupCompilationHints(
             (memoryLevel == "SRAM")  ? NNPI_ALLOCATION_SRAM
             : (memoryLevel == "LLC") ? NNPI_ALLOCATION_LLC
                                      : NNPI_ALLOCATION_DRAM;
-        hint.tensorPlacement.priority = 0.0f;
+        // positive priority is required to enforce the hints
+        hint.tensorPlacement.priority = 1.0f;
         hints.emplace_back(hint);
       }
     }
@@ -342,15 +364,16 @@ Error NNPICompiledFunction::compile(Function *F, const BackendOptions &opts) {
 
   NNPIImporter importer(compilationOptions_);
   // requiresDSPKernels set by importFunction.
-  bool requiresDSPKernels;
+  bool requiresDSPKernels = false;
   network_ = importer.importFunction(F, newOpts, requiresDSPKernels);
   iaExtensionPaths_ = importer.getIAExtensionPaths();
+  iaExtensionLibs_ = importer.getIAExtensionLibs();
 
   LOG_IF_INVALID_HANDLE_RETURN_LLVMERROR(network_, "Failed to import function");
   // Setting the network name.
   std::string networkName = compilationFileName_;
   if (compilationFileName_.empty()) {
-    networkName = F->getName();
+    networkName = F->getName().str();
   }
   ASSERT_LOG_NNPI_ERROR(nnpiNetworkSetName(network_, networkName.c_str()),
                         "Failed to set NNPI network name");
@@ -425,10 +448,13 @@ Error NNPICompiledFunction::compile(Function *F, const BackendOptions &opts) {
         }
       };
       DBG_MEM_USAGE("NNPICompiledFunction call get compile <<");
-      LOG_NNPI_IF_ERROR_RETURN_LLVMERROR(
-          nnpiNetworkCompileToStream(network_, &config_, &outFileStream, NULL),
-          "Failed NNPI Compile");
+      if (!opts.useDeserialize) {
 
+        LOG_NNPI_IF_ERROR_RETURN_LLVMERROR(
+            nnpiNetworkCompileToStream(network_, &config_, &outFileStream,
+                                       NULL),
+            "Failed NNPI Compile");
+      }
       DBG_MEM_USAGE("NNPICompiledFunction done compile <<");
     } else // Compile to file.
     {
@@ -478,76 +504,10 @@ Error NNPICompiledFunction::compile(Function *F, const BackendOptions &opts) {
     }
   }
 
-  findSLSInputs(F);
-
   // Update device network config.
   devNetConfig_ = parseDeviceNetworkConfig(compilationOptions_);
 
   return Error::success();
-}
-
-void NNPICompiledFunction::findSLSInputs(Function *F) {
-  // Gather all the placeholders of an SLS or EmbeddingBag
-  for (auto const &node : F->getNodes()) {
-    if (auto *SLS =
-            llvm::dyn_cast<FusedRowwiseQuantizedSparseLengthsWeightedSumNode>(
-                &node)) {
-      VLOG(1) << SLS->getIndices() << " " << SLS->getWeights() << " "
-              << SLS->getLengths() << " " << SLS->getData().dims()[0];
-      validateSLSInputs_.emplace_back(
-          /* isEmeddingBag */ false, SLS->getData().dims()[0],
-          llvm::dyn_cast<Placeholder>(SLS->getIndices()),
-          llvm::dyn_cast<Placeholder>(SLS->getWeights()),
-          llvm::dyn_cast<Placeholder>(SLS->getLengths()),
-          /* offsets */ nullptr);
-    } else if (auto *SLS =
-                   llvm::dyn_cast<FusedRowwiseQuantizedSparseLengthsSumNode>(
-                       &node)) {
-      VLOG(1) << SLS->getIndices() << " " << SLS->getLengths() << " "
-              << SLS->getData().dims()[0];
-      validateSLSInputs_.emplace_back(
-          /* isEmeddingBag */ false, SLS->getData().dims()[0],
-          llvm::dyn_cast<Placeholder>(SLS->getIndices()), /* weights */ nullptr,
-          llvm::dyn_cast<Placeholder>(SLS->getLengths()),
-          /* offsets */ nullptr);
-    } else if (auto *SLS = llvm::dyn_cast<SparseLengthsSumNode>(&node)) {
-      VLOG(1) << SLS->getIndices() << " " << SLS->getLengths() << " "
-              << SLS->getData().dims()[0];
-      validateSLSInputs_.emplace_back(
-          /* isEmeddingBag */ false, SLS->getData().dims()[0],
-          llvm::dyn_cast<Placeholder>(SLS->getIndices()),
-          /* weights */ nullptr, llvm::dyn_cast<Placeholder>(SLS->getLengths()),
-          /* offsets */ nullptr);
-    } else if (auto *SLS =
-                   llvm::dyn_cast<SparseLengthsWeightedSumNode>(&node)) {
-      VLOG(1) << SLS->getIndices() << " " << SLS->getWeights() << " "
-              << SLS->getLengths() << " " << SLS->getData().dims()[0];
-      validateSLSInputs_.emplace_back(
-          /* isEmeddingBag */ false, SLS->getData().dims()[0],
-          llvm::dyn_cast<Placeholder>(SLS->getIndices()),
-          llvm::dyn_cast<Placeholder>(SLS->getWeights()),
-          llvm::dyn_cast<Placeholder>(SLS->getLengths()),
-          /* offsets */ nullptr);
-    } else if (auto *EBB = llvm::dyn_cast<EmbeddingBagNode>(&node)) {
-      VLOG(1) << EBB->getIndices() << " " << EBB->getOffsets() << " "
-              << EBB->getData().dims()[0];
-      validateSLSInputs_.emplace_back(
-          /* isEmeddingBag */ true, EBB->getData().dims()[0],
-          llvm::dyn_cast<Placeholder>(EBB->getIndices()),
-          /* weights */ nullptr,
-          /* lengths */ nullptr,
-          llvm::dyn_cast<Placeholder>(EBB->getOffsets()));
-    } else if (auto *EBB =
-                   llvm::dyn_cast<EmbeddingBagByteRowwiseOffsetsNode>(&node)) {
-      VLOG(1) << EBB->getIndices() << " " << EBB->getWeights() << " "
-              << EBB->getOffsets() << " " << EBB->getData().dims()[0];
-      validateSLSInputs_.emplace_back(
-          /* isEmeddingBag */ true, EBB->getData().dims()[0],
-          llvm::dyn_cast<Placeholder>(EBB->getIndices()),
-          llvm::dyn_cast<Placeholder>(EBB->getWeights()), /* lengths */ nullptr,
-          llvm::dyn_cast<Placeholder>(EBB->getOffsets()));
-    }
-  }
 }
 
 NNPICompiledFunction::NNPICompiledFunction(Function *F)
@@ -840,4 +800,17 @@ const std::string NNPICompiledFunction::toJSON() const {
   fs << edgesToJSON(compilationInfo_.opDependencies) << std::endl;
   fs << "}" << std::endl;
   return fs.str();
+}
+
+std::unique_ptr<BlockStreamBase> NNPICompiledFunction::serialize() {
+  compiledStream_.resetRead();
+  return std::make_unique<BlockStream>(compiledStream_);
+}
+
+Error NNPICompiledFunction::deserialize(
+    const std::vector<char> &serializedData) {
+  compiledStream_.releaseMemory();
+  const char *buffer = reinterpret_cast<const char *>(serializedData.data());
+  compiledStream_.write(buffer, serializedData.size());
+  return Error::success();
 }

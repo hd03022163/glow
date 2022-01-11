@@ -18,6 +18,9 @@
 #define GLOW_IMPORTER_TFLITEMODELLOADER_H
 
 #include "glow/Graph/Graph.h"
+
+#define FLATBUFFERS_LOCALE_INDEPENDENT 0
+#include "flatbuffers/flexbuffers.h"
 #include "schema_generated.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -68,6 +71,9 @@ class TFLiteModelLoader {
   /// \returns the shape of the tensor \p tensor.
   Expected<std::vector<dim_t>> getTensorShape(const tflite::Tensor *tensor);
 
+  /// \returns whether the shape of the tensor \p tensor is undefined.
+  Expected<bool> isTensorShapeUndefined(const tflite::Tensor *tensor);
+
   /// \returns the element type of the tensor \p tensor.
   Expected<ElemKind> getTensorElemKind(const tflite::Tensor *tensor);
 
@@ -99,6 +105,9 @@ class TFLiteModelLoader {
   /// \returns the operator code of the operator \p op.
   Expected<tflite::BuiltinOperator> getOperatorCode(const tflite::Operator *op);
 
+  /// \returns the operator custom code of the operator \p op.
+  Expected<std::string> getOperatorCustomCode(const tflite::Operator *op);
+
   /// \returns the operator version of the operator \p op.
   Expected<int32_t> getOperatorVersion(const tflite::Operator *op);
 
@@ -108,10 +117,14 @@ class TFLiteModelLoader {
   /// \returns the operator name of the operator \p op.
   Expected<std::string> getOperatorName(const tflite::Operator *op);
 
+  /// \returns the operator custom options as a map.
+  Expected<flexbuffers::Map> getOperatorCustomOpts(const tflite::Operator *op);
+
   /// \returns the tensor index of the input operand with index \p inputIdx
-  /// of the operator \p op.
-  Expected<size_t> getOperatorInputTensorIdx(const tflite::Operator *op,
-                                             size_t inputIdx);
+  /// of the operator \p op. This function returns a negative number if the
+  /// tensor does not exist (is not used).
+  Expected<int32_t> getOperatorInputTensorIdx(const tflite::Operator *op,
+                                              size_t inputIdx);
 
   /// \returns the tensor index of the output operand with index \p outputIdx
   /// of the operator \p op.
@@ -132,21 +145,32 @@ class TFLiteModelLoader {
   Error setNodeValueByIndex(size_t index, NodeValue nodeValue);
 
   /// \returns Expected<NodeValue> if an input node value with the given index
-  /// \p index (operator level index that is 0 for 1st input node value, etc)
+  /// \p inputIdx (operator level index that is 0 for 1st input node value, etc)
   /// is found for the operator \p op and Error otherwise.
   Expected<NodeValue> getInputNodeValue(const tflite::Operator *op,
                                         size_t inputIdx);
 
   /// Register the single output node value \p nodeValue for the operator \p op.
-  Error setOutputNodeValue(const tflite::Operator *op, NodeValue nodeValue);
+  /// The flag \p checkType specifies whether the type of the given node value
+  /// is checked to be the same with the type registered in the model.
+  Error setOutputNodeValue(const tflite::Operator *op, NodeValue nodeValue,
+                           bool checkType = true);
 
   /// Register multiple output node values \p nodeValues for the operator \p op.
+  /// The flag \p checkType specifies whether the type of the given node value
+  /// is checked to be the same with the type registered in the model.
   Error setOutputNodeValues(const tflite::Operator *op,
-                            llvm::ArrayRef<NodeValue> nodeValues);
+                            llvm::ArrayRef<NodeValue> nodeValues,
+                            bool checkType = true);
 
   /// \returns the output type for operator \p op with index \p outputIndex.
   Expected<TypeRef> getOutputType(const tflite::Operator *op,
                                   size_t outputIndex);
+
+  /// \returns whether the output shape for operator \p op with index
+  /// \p outputIndex is undefined.
+  Expected<bool> isOutputShapeUndefined(const tflite::Operator *op,
+                                        size_t outputIndex);
 
   /// Initialize the node value array \ref nodeValueByIndex_.
   void initializeNodeValues();
@@ -248,6 +272,9 @@ class TFLiteModelLoader {
   /// Load Softmax operator.
   Error loadSoftmax(const tflite::Operator *op, const OperatorInfo &opInfo);
 
+  /// Load LogSoftmax operator.
+  Error loadLogSoftmax(const tflite::Operator *op, const OperatorInfo &opInfo);
+
   /// Load Pad operator.
   Error loadPad(const tflite::Operator *op, const OperatorInfo &opInfo);
 
@@ -263,12 +290,43 @@ class TFLiteModelLoader {
   /// Load Arg operator (ArgMax or ArgMin).
   Error loadArg(const tflite::Operator *op, const OperatorInfo &opInfo);
 
+  /// Load Shape operator.
+  Error loadShape(const tflite::Operator *op, const OperatorInfo &opInfo);
+
   /// Load Slice operator.
   Error loadSlice(const tflite::Operator *op, const OperatorInfo &opInfo);
+
+  /// Load StridedSlice operator.
+  Error loadStridedSlice(const tflite::Operator *op,
+                         const OperatorInfo &opInfo);
 
   /// Load Resize Bilinear operator.
   Error loadResizeBilinear(const tflite::Operator *op,
                            const OperatorInfo &opInfo);
+
+  /// Load Resize Nearest operator.
+  Error loadResizeNearest(const tflite::Operator *op,
+                          const OperatorInfo &opInfo);
+
+  /// Load SpaceToDepth operator.
+  Error loadSpaceToDepth(const tflite::Operator *op,
+                         const OperatorInfo &opInfo);
+
+  /// Load DepthToSpace operator.
+  Error loadDepthToSpace(const tflite::Operator *op,
+                         const OperatorInfo &opInfo);
+
+  /// Load Cast operator.
+  Error loadCast(const tflite::Operator *op, const OperatorInfo &opInfo);
+
+  /// Load Gather operator.
+  Error loadGather(const tflite::Operator *op, const OperatorInfo &opInfo);
+
+  /// Load Gather ND operator.
+  Error loadGatherND(const tflite::Operator *op, const OperatorInfo &opInfo);
+
+  /// Load Select operator.
+  Error loadSelect(const tflite::Operator *op, const OperatorInfo &opInfo);
 
   /// Load Space To Batch ND operator.
   Error loadSpaceToBatchNd(const tflite::Operator *op,
@@ -286,6 +344,20 @@ class TFLiteModelLoader {
 
   /// Load Unpack operator.
   Error loadUnpack(const tflite::Operator *op, const OperatorInfo &opInfo);
+
+  /// Load TFLite Detection PostProcess custom operator.
+  Error loadTFLiteDetectionPostProcess(const tflite::Operator *op,
+                                       const OperatorInfo &opInfo,
+                                       const flexbuffers::Map &opts);
+
+  /// Load TFLite Audio Spectrogram custom operator.
+  Error loadTFLiteAudioSpectrogram(const tflite::Operator *op,
+                                   const OperatorInfo &opInfo,
+                                   const flexbuffers::Map &opts);
+
+  /// Load TFLite MFCC custom operator.
+  Error loadTFLiteMFCC(const tflite::Operator *op, const OperatorInfo &opInfo,
+                       const flexbuffers::Map &opts);
 
 public:
   /// \returns the TensorFlowLite model version.

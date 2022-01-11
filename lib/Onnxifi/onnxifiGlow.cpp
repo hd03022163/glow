@@ -16,10 +16,12 @@
 
 #include "Base.h"
 #include "GlowOnnxifiManager.h"
+#include "folly/String.h"
 #include "llvm/Support/CommandLine.h"
 
 #include "glow/Flags/Flags.h"
 #include "glow/Importer/ONNXIFIModelLoader.h"
+#include "glow/Runtime/RequestData.h"
 
 #include <cstring>
 #include <glog/logging.h>
@@ -220,7 +222,7 @@ GLOW_ONNXIFI_LIBRARY_FUNCTION_WRAPPER(onnxGetBackendInfo)(
     return setBackendInfoString(
         infoValue, infoValueSize,
         "onnxSetIOAndRunGraphFunction onnxWaitEventForFunction "
-        "onnxReleaseTraceEventsFunction");
+        "onnxReleaseTraceEventsFunction onnxGetCurrentBatchSizeFunction");
   default:
     return ONNXIFI_STATUS_UNSUPPORTED_PROPERTY;
   }
@@ -483,9 +485,26 @@ static onnxStatus verifyDescriptors(uint32_t count,
       return ONNXIFI_STATUS_INVALID_MEMORY_TYPE;
     }
 
-    if (!descriptor.buffer &&
-        !(descriptor.dimensions == 1 && descriptor.shape[0] == 0)) {
-      return ONNXIFI_STATUS_INVALID_MEMORY_LOCATION;
+    if (!descriptor.buffer) {
+      bool hasZeroDims = false;
+      for (int i = 0; i < descriptor.dimensions; ++i) {
+        if (descriptor.shape[i] == 0) {
+          hasZeroDims = true;
+          break;
+        }
+      }
+
+      if (!hasZeroDims) {
+        LOG(ERROR) << "Bad memory on input " << descriptor.name << " (" << i
+                   << " out of " << count
+                   << "). It has no memory buffer, but has "
+                   << descriptor.dimensions << " dimensions: ["
+                   << folly::join(
+                          ",", llvm::ArrayRef<uint64_t>(descriptor.shape,
+                                                        descriptor.dimensions))
+                   << "]";
+        return ONNXIFI_STATUS_INVALID_MEMORY_LOCATION;
+      }
     }
   }
 
@@ -597,6 +616,20 @@ GLOW_ONNXIFI_LIBRARY_FUNCTION_WRAPPER(onnxReleaseTraceEvents)(
   return ONNXIFI_STATUS_SUCCESS;
 }
 
+EXTERNC ONNXIFI_PUBLIC ONNXIFI_CHECK_RESULT onnxStatus ONNXIFI_ABI
+GLOW_ONNXIFI_LIBRARY_FUNCTION_WRAPPER(onnxGetCurrentBatchSize)(
+    int64_t *currentBatchSize) {
+  if (!currentBatchSize) {
+    return ONNXIFI_STATUS_INVALID_POINTER;
+  }
+  auto requestData = glow::runtime::RequestData::get();
+  if (!requestData) {
+    return ONNXIFI_STATUS_INVALID_STATE;
+  }
+  *currentBatchSize = requestData->currentBatchSize;
+  return ONNXIFI_STATUS_SUCCESS;
+}
+
 /// Set Onnxifi option
 EXTERNC ONNXIFI_PUBLIC ONNXIFI_CHECK_RESULT onnxStatus ONNXIFI_ABI
 GLOW_ONNXIFI_LIBRARY_FUNCTION_WRAPPER(onnxSetOption)(const char *optionName,
@@ -675,6 +708,9 @@ GLOW_ONNXIFI_LIBRARY_FUNCTION_WRAPPER(onnxGetExtensionFunctionAddress)(
           {"onnxReleaseTraceEventsFunction",
            reinterpret_cast<onnxExtensionFunctionPointer>(
                GLOW_ONNXIFI_LIBRARY_FUNCTION_WRAPPER(onnxReleaseTraceEvents))},
+          {"onnxGetCurrentBatchSizeFunction",
+           reinterpret_cast<onnxExtensionFunctionPointer>(
+               GLOW_ONNXIFI_LIBRARY_FUNCTION_WRAPPER(onnxGetCurrentBatchSize))},
           {"onnxSetOptionFunction",
            reinterpret_cast<onnxExtensionFunctionPointer>(
                GLOW_ONNXIFI_LIBRARY_FUNCTION_WRAPPER(onnxSetOption))},

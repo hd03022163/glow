@@ -38,12 +38,10 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/TargetSelect.h"
-#include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/IPO/ForceFunctionAttrs.h"
 #include "llvm/Transforms/IPO/FunctionAttrs.h"
 #include "llvm/Transforms/IPO/InferFunctionAttrs.h"
 #include "llvm/Transforms/IPO/Internalize.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Instrumentation.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/GVN.h"
@@ -68,6 +66,15 @@ LLVMIRGen::getInlinineAttr(const llvm::Function *F) const {
   return llvm::Attribute::AttrKind::None;
 }
 
+void LLVMIRGen::populatePassManagerBuilderOptions(
+    llvm::PassManagerBuilder &PMB) {
+  PMB.OptLevel = 2;
+  PMB.SizeLevel = 0;
+  PMB.LoopVectorize = true;
+  PMB.SLPVectorize = false;
+  PMB.Inliner = llvm::createFunctionInliningPass();
+}
+
 void LLVMIRGen::updateInlineAttributes(llvm::Module *M) {
   for (auto &FF : *M) {
     if (FF.isDeclaration()) {
@@ -78,6 +85,24 @@ void LLVMIRGen::updateInlineAttributes(llvm::Module *M) {
     bool alwaysInline =
         FF.hasFnAttribute(llvm::Attribute::AttrKind::AlwaysInline);
     bool optnone = FF.hasFnAttribute(llvm::Attribute::AttrKind::OptimizeNone);
+
+    bool hasOmitFramePointer = FF.hasFnAttribute("omit-frame-pointer");
+    llvm::Attribute omitFramePointerAttr;
+    if (hasOmitFramePointer) {
+      omitFramePointerAttr = FF.getFnAttribute("omit-frame-pointer");
+    }
+
+    bool hasFramePointer = FF.hasFnAttribute("frame-pointer");
+    llvm::Attribute framePointerAttr;
+    if (hasFramePointer) {
+      framePointerAttr = FF.getFnAttribute("frame-pointer");
+    }
+
+    bool hasNoFramePointerElim = FF.hasFnAttribute("no-frame-pointer-elim");
+    llvm::Attribute noFramePointerElimAttr;
+    if (hasNoFramePointerElim) {
+      noFramePointerElimAttr = FF.getFnAttribute("no-frame-pointer-elim");
+    }
 
     auto inlineAttr = getInlinineAttr(&FF);
     if (inlineAttr != llvm::Attribute::AttrKind::None) {
@@ -91,6 +116,17 @@ void LLVMIRGen::updateInlineAttributes(llvm::Module *M) {
     // noalias.
     FF.setAttributes(FF.getAttributes().removeAttributes(
         M->getContext(), llvm::AttributeList::FunctionIndex));
+    if (hasOmitFramePointer) {
+      FF.addFnAttr("omit-frame-pointer",
+                   omitFramePointerAttr.getValueAsString());
+    }
+    if (hasFramePointer) {
+      FF.addFnAttr("frame-pointer", framePointerAttr.getValueAsString());
+    }
+    if (hasNoFramePointerElim) {
+      FF.addFnAttr("no-frame-pointer-elim",
+                   noFramePointerElimAttr.getValueAsString());
+    }
     // Force inline all non-no-inline functions.
     if (!dontInline || alwaysInline) {
       FF.addFnAttr(llvm::Attribute::AttrKind::AlwaysInline);
@@ -146,12 +182,8 @@ void LLVMIRGen::optimizeLLVMModule(llvm::Module *M, llvm::TargetMachine &TM) {
   // else.
   performSpecialization();
 
-  llvm::PassManagerBuilder PMB;
-  PMB.OptLevel = 2;
-  PMB.SizeLevel = 0;
-  PMB.LoopVectorize = true;
-  PMB.SLPVectorize = false;
-  PMB.Inliner = llvm::createFunctionInliningPass();
+  // Add instrumentation into the code for better debugging experience.
+  performDebugInstrumentation();
 
   M->setTargetTriple(TM.getTargetTriple().normalize());
   M->setDataLayout(TM.createDataLayout());
@@ -165,6 +197,11 @@ void LLVMIRGen::optimizeLLVMModule(llvm::Module *M, llvm::TargetMachine &TM) {
     if (FF.isDeclaration()) {
       continue;
     }
+    if (FF.hasFnAttribute("no-frame-pointer-elim") ||
+        FF.hasFnAttribute("frame-pointer") ||
+        FF.hasFnAttribute("omit-frame-pointer")) {
+      continue;
+    }
     FF.addFnAttr("no-frame-pointer-elim", "true");
   }
 
@@ -173,9 +210,6 @@ void LLVMIRGen::optimizeLLVMModule(llvm::Module *M, llvm::TargetMachine &TM) {
   // entry point. To enable better LLVM optimizations "main" should always be
   // inlined.
   getLLVMFunction()->addFnAttr(llvm::Attribute::AttrKind::AlwaysInline);
-
-  llvm::legacy::FunctionPassManager FPM(M);
-  llvm::legacy::PassManager PM;
 
   // Add an appropriate TargetLibraryInfo pass for the module's triple.
   llvm::TargetLibraryInfoImpl TLII(llvm::Triple(M->getTargetTriple()));
@@ -187,6 +221,12 @@ void LLVMIRGen::optimizeLLVMModule(llvm::Module *M, llvm::TargetMachine &TM) {
   }
 
   auto *TLIWP = new llvm::TargetLibraryInfoWrapperPass(TLII);
+
+  llvm::legacy::FunctionPassManager FPM(M);
+  llvm::legacy::PassManager PM;
+  llvm::PassManagerBuilder PMB;
+  populatePassManagerBuilderOptions(PMB);
+
   PM.add(TLIWP);
 
   // Add internal analysis passes from the target machine.
@@ -195,6 +235,7 @@ void LLVMIRGen::optimizeLLVMModule(llvm::Module *M, llvm::TargetMachine &TM) {
 
   PMB.populateFunctionPassManager(FPM);
   PMB.populateModulePassManager(PM);
+
   FPM.doInitialization();
   PM.run(*M);
   for (auto &FF : *M) {

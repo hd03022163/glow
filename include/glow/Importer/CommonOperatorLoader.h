@@ -931,7 +931,8 @@ protected:
     // argument name "axes". That's why the name is passed as a parameter.
     std::vector<unsigned_t> perm;
     if (dict.count(permArgName.str()))
-      ASSIGN_VALUE_OR_RETURN_ERR(perm, getShape<unsigned_t>(dict[permArgName]));
+      ASSIGN_VALUE_OR_RETURN_ERR(perm,
+                                 getShape<unsigned_t>(dict[permArgName.str()]));
 
     if (perm.empty()) {
       // Empty permutation argument means reversing axes order.
@@ -1193,6 +1194,8 @@ protected:
     ASSIGN_VALUE_OR_RETURN_ERR(X, getNodeValueByName(op.input(0)));
     NodeValue Y;
     ASSIGN_VALUE_OR_RETURN_ERR(Y, getNodeValueByName(op.input(1)));
+    RETURN_ERR_IF_NOT(X.dims() == Y.dims(),
+                      opErrMsg(op, "X and Y must have the same dimensions"));
     auto *node = G_->createDotProduct(loadOperatorName(op), X, Y);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
     return Error::success();
@@ -1259,13 +1262,22 @@ protected:
     NodeValue dataToInferDim;
     ASSIGN_VALUE_OR_RETURN_ERR(dataToInferDim, getNodeValueByName(op.input(2)));
 
-    RETURN_ERR_IF_NOT(indices.dims().size() == 1,
-                      opErrMsg(op, "Indices must be 1D tensor."));
+    RETURN_ERR_IF_NOT(indices.dims().size() == 1 || indices.dims().size() == 2,
+                      opErrMsg(op, "Indices must be 1D or 2D tensor."));
     RETURN_ERR_IF_NOT(indices.getElementType() == ElemKind::Int32ITy ||
                           indices.getElementType() == ElemKind::Int64ITy,
                       opErrMsg(op, "Indices must be of int32 or int64 type."));
 
     const std::string &opName = loadOperatorName(op);
+
+    if (indices.dims().size() == 1) {
+      indices = G_->createReshape(opName + ".indices2D", indices,
+                                  {indices.dims()[0], 1});
+    } else {
+      RETURN_ERR_IF_NOT(
+          indices.dims()[1] == 1,
+          opErrMsg(op, "Second dimension should be 1 in indices."));
+    }
 
     ShapeVector outDims{values.dims().begin(), values.dims().end()};
     outDims[0] = dataToInferDim.dims()[0];
@@ -1276,12 +1288,8 @@ protected:
     // SparseToDense has very similar behavior to ScatterND from ONNX
     // https://github.com/onnx/onnx/blob/master/docs/Operators.md#ScatterND,
     // therefore we can use ScatterND to implement SparseToDense.
-    // The difference is that SparseToDense requires 1D indices tensor,
-    // while ScatterND requires 2D indices tensor.
-    Node *indices2D = G_->createReshape(opName + ".indices2D", indices,
-                                        {indices.dims()[0], 1});
-    Node *result = G_->createScatterData(opName + ".scatterData", data,
-                                         indices2D, values, true);
+    Node *result = G_->createScatterData(opName + ".scatterData", data, indices,
+                                         values, true);
 
     RETURN_IF_ERR(addNodeAsOutput(op, result));
     return Error::success();
@@ -1332,13 +1340,12 @@ protected:
     ASSIGN_VALUE_OR_RETURN_ERR(data, getNodeValueByName(op.input(0)));
     NodeValue indices;
     ASSIGN_VALUE_OR_RETURN_ERR(indices, getNodeValueByName(op.input(1)));
-    size_t batchDims = typeName == "Gather" ? 0 : 1;
+    size_t axis = typeName == "Gather" ? 0 : 1;
 
     if (dict.count("axis")) {
-      int axis;
       ASSIGN_VALUE_OR_RETURN_ERR(
-          axis, loadAxis<int>(dict.find("axis")->second, data.dims().size()));
-      batchDims = axis;
+          axis,
+          loadAxis<size_t>(dict.find("axis")->second, data.dims().size()));
     }
 
     if (indices.getElementType() != ElemKind::Int64ITy &&
@@ -1351,7 +1358,7 @@ protected:
           G_->getParent()->uniqueType(ElemKind::Int32ITy, indices.dims()));
     }
 
-    auto *GN = G_->createGather(loadOperatorName(op), data, indices, batchDims);
+    auto *GN = G_->createGather(loadOperatorName(op), data, indices, axis);
     RETURN_IF_ERR(addNodeAsOutput(op, GN));
     return Error::success();
   }
@@ -1638,11 +1645,11 @@ protected:
       return true;
     }
     if (typeName == "Gather" || typeName == "BatchGather") {
-      RETURN_IF_ERR(loadGatherOps(typeName, op, dict));
+      RETURN_IF_ERR(loadGatherOps(typeName.str(), op, dict));
       return true;
     }
     if (typeName == "GatherND") {
-      RETURN_IF_ERR(loadGatherND(typeName, op, dict));
+      RETURN_IF_ERR(loadGatherND(typeName.str(), op, dict));
       return true;
     }
     if (typeName == "GatherRanges") {

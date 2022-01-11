@@ -65,7 +65,8 @@ static unsigned getPointerNumBits(const llvm::TargetMachine &TM) {
 
 LLVMIRGen::LLVMIRGen(const IRFunction *F, AllocationsInfo &allocationsInfo,
                      std::string mainEntryName, llvm::StringRef libjitBC)
-    : F_(F), allocationsInfo_(allocationsInfo), libjitBC_(libjitBC) {
+    : F_(F), ctx_(std::make_unique<llvm::LLVMContext>()),
+      allocationsInfo_(allocationsInfo), libjitBC_(libjitBC) {
   // Legalize main entry name.
   setMainEntryName(mainEntryName);
 }
@@ -73,7 +74,8 @@ LLVMIRGen::LLVMIRGen(const IRFunction *F, AllocationsInfo &allocationsInfo,
 LLVMIRGen::LLVMIRGen(const IRFunction *F, AllocationsInfo &allocationsInfo,
                      std::string mainEntryName, llvm::StringRef libjitBC,
                      llvm::ArrayRef<llvm::MemoryBufferRef> objectRegistry)
-    : F_(F), allocationsInfo_(allocationsInfo), libjitBC_(libjitBC),
+    : F_(F), ctx_(std::make_unique<llvm::LLVMContext>()),
+      allocationsInfo_(allocationsInfo), libjitBC_(libjitBC),
       objectRegistry_(objectRegistry) {
   // Legalize main entry name.
   setMainEntryName(mainEntryName);
@@ -81,6 +83,16 @@ LLVMIRGen::LLVMIRGen(const IRFunction *F, AllocationsInfo &allocationsInfo,
 
 /// Mutex to protect LLVM's TargetRegistry.
 static std::mutex initTargetMutex;
+
+void LLVMIRGen::initTargetOptions(llvm::TargetOptions &targetOpts,
+                                  const LLVMBackendOptions &backendOpts) {
+  if (backendOpts.getFloatABI().hasValue()) {
+    targetOpts.FloatABIType = backendOpts.getFloatABI().getValue();
+  }
+  if (!backendOpts.getABIName().empty()) {
+    targetOpts.MCOptions.ABIName = backendOpts.getABIName();
+  }
+}
 
 void LLVMIRGen::initTargetMachine(const LLVMBackendOptions &opts) {
   // LLVM's TargetRegistry is not thread safe so we add a critical section.
@@ -92,12 +104,9 @@ void LLVMIRGen::initTargetMachine(const LLVMBackendOptions &opts) {
   llvm::InitializeAllAsmParsers();
 
   llvm::TargetOptions targetOpts;
-  if (opts.getFloatABI().hasValue()) {
-    targetOpts.FloatABIType = opts.getFloatABI().getValue();
-  }
-  if (!opts.getABIName().empty()) {
-    targetOpts.MCOptions.ABIName = opts.getABIName();
-  }
+  // Initialize target options in a backend-specific way.
+  initTargetOptions(targetOpts, opts);
+
   if (opts.getTarget().empty()) {
     TM_.reset(llvm::EngineBuilder()
                   .setCodeModel(opts.getCodeModel())
@@ -121,6 +130,15 @@ llvm::StringRef LLVMIRGen::getBundleName() const { return bundleName_; }
 
 void LLVMIRGen::setBundleName(const std::string &name) {
   bundleName_ = name.empty() ? "bundle" : legalizeName(name);
+}
+
+llvm::StringRef LLVMIRGen::getSavedBundleName() const {
+  return savedBundleName_;
+}
+
+void LLVMIRGen::setSavedBundleName(const std::string &name) {
+  assert(!name.empty() && "Name cannot be empty");
+  savedBundleName_ = name;
 }
 
 std::string LLVMIRGen::getMainEntryName() const { return mainEntryName_; }
@@ -252,6 +270,8 @@ llvm::Type *LLVMIRGen::getElementType(llvm::IRBuilder<> &builder,
     return builder.getInt16Ty();
   case ElemKind::Int32QTy:
     return builder.getInt32Ty();
+  case ElemKind::Int64QTy:
+    return builder.getInt64Ty();
   case ElemKind::UInt8ITy:
     return builder.getInt8Ty();
   case ElemKind::Int32ITy:
@@ -382,6 +402,9 @@ llvm::Value *LLVMIRGen::emitValueAddress(llvm::IRBuilder<> &builder,
   case ElemKind::Int32QTy:
     T = llvm::Type::getInt32PtrTy(getLLVMContext());
     break;
+  case ElemKind::Int64QTy:
+    T = llvm::Type::getInt64PtrTy(getLLVMContext());
+    break;
   case ElemKind::Int64ITy:
     T = llvm::Type::getInt64PtrTy(getLLVMContext());
     break;
@@ -389,7 +412,7 @@ llvm::Value *LLVMIRGen::emitValueAddress(llvm::IRBuilder<> &builder,
     T = llvm::Type::getInt32PtrTy(getLLVMContext());
     break;
   case ElemKind::UInt8ITy:
-    T = llvm::Type::getInt8PtrTy(ctx_);
+    T = llvm::Type::getInt8PtrTy(getLLVMContext());
     break;
   case ElemKind::UInt8FusedQTy:
     T = llvm::Type::getInt8PtrTy(getLLVMContext());
@@ -498,10 +521,11 @@ llvm::Value *LLVMIRGen::emitConstFloatArray(llvm::IRBuilder<> &builder,
                                             llvm::ArrayRef<float> vals) {
   std::vector<llvm::Constant *> elems;
   for (auto I : vals) {
-    elems.push_back(
-        llvm::ConstantFP::get(llvm::Type::getFloatTy(ctx_), (float)I));
+    elems.push_back(llvm::ConstantFP::get(
+        llvm::Type::getFloatTy(getLLVMContext()), (float)I));
   }
-  return emitConstArray(builder, elems, llvm::Type::getFloatTy(ctx_));
+  return emitConstArray(builder, elems,
+                        llvm::Type::getFloatTy(getLLVMContext()));
 }
 
 llvm::Value *LLVMIRGen::emitConstArray(llvm::IRBuilder<> &builder,
@@ -657,6 +681,8 @@ llvm::Value *LLVMIRGen::emitConst(llvm::IRBuilder<> &builder, float val,
     return builder.getInt32(static_cast<int32_t>(val));
   case ElemKind::UInt8ITy:
     return builder.getInt8(static_cast<uint8_t>(val));
+  case ElemKind::Int64QTy:
+    return builder.getInt64(static_cast<int64_t>(val));
   case ElemKind::Int32ITy:
     return builder.getInt32(static_cast<int32_t>(val));
   case ElemKind::UInt8FusedQTy:
@@ -680,9 +706,14 @@ llvm::Value *LLVMIRGen::emitStringConst(llvm::IRBuilder<> &builder,
   llvm::GlobalVariable *gvarStr = new llvm::GlobalVariable(
       *llmodule_, constStrArray->getType(), true,
       llvm::GlobalValue::PrivateLinkage, constStrArray, ".str");
+#if LLVM_VERSION_MAJOR >= 10
+  gvarStr->setAlignment(llvm::MaybeAlign(1));
+#else
   gvarStr->setAlignment(1);
+#endif
   // Add unnamed_addr attribute to enable constmerge pass.
   gvarStr->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+
   return builder.CreateBitCast(gvarStr, builder.getInt8PtrTy());
 }
 
@@ -1266,6 +1297,7 @@ void LLVMIRGen::generateLLVMIRForDataParallelInstr(
     ARITHMETIC_UNARY_OP_CASE(ElementCeil, "element_ceil");
     ARITHMETIC_UNARY_OP_CASE(ElementRound, "element_round");
     ARITHMETIC_UNARY_OP_CASE(ElementSqrt, "element_sqrt");
+    ARITHMETIC_UNARY_OP_CASE(ElementErf, "element_erf");
     ARITHMETIC_UNARY_OP_CASE(ElementRsqrt, "element_rsqrt");
     ARITHMETIC_UNARY_OP_CASE(ElementReciprocal, "element_reciprocal");
     ARITHMETIC_UNARY_OP_CASE(ElementSin, "element_sin");
@@ -3084,7 +3116,7 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
     auto *dest = GI->getDest();
     auto *data = GI->getData();
     auto *indices = GI->getIndices();
-    unsigned batchDims = GI->getBatchDims();
+    unsigned axis = GI->getBatchDims();
 
     auto *destPtr = emitValueAddress(builder, dest);
     auto *dataPtr = emitValueAddress(builder, data);
@@ -3095,9 +3127,9 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
     auto *dataType = data->getType();
 
     // The size of the sample in the batch.
-    size_t sampleSize = dataType->getSliceSize(batchDims);
+    size_t sampleSize = dataType->getSliceSize(axis);
     // The size of the slices that we gather.
-    size_t sliceSize = dataType->getSliceSize(batchDims + 1);
+    size_t sliceSize = dataType->getSliceSize(axis + 1);
     // The size of each sample in the batch.
     size_t numSamples = dataType->size() / sampleSize;
 
@@ -3105,7 +3137,7 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
     auto *numSamplesVal = emitConstDimT(builder, numSamples);
     auto *sampleSizeVal = emitConstDimT(builder, sampleSize);
 
-    // Dispatching function depeending on the input type of Indices.
+    // Dispatching function depending on the input type of Indices.
     llvm::Function *F = nullptr;
     if (indices->getElementType() == ElemKind::Int64ITy) {
       F = getFunction("gather64", dest->getElementType());
@@ -3119,6 +3151,74 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
     createCall(builder, F,
                {destPtr, dataPtr, indicesPtr, indicesSize, sliceSizeVal,
                 numSamplesVal, sampleSizeVal});
+    break;
+  }
+
+  case Kinded::Kind::GatherNDInstKind: {
+    auto *GI = llvm::cast<GatherNDInst>(I);
+    auto *dest = GI->getDest();
+    auto *data = GI->getData();
+    auto *indices = GI->getIndices();
+    unsigned batchDims = GI->getBatchDims();
+
+    auto dataDims = data->dims();
+    auto indicesDims = indices->dims();
+    dim_t indicesDimLast = indicesDims.back();
+
+    // Compute batch count.
+    dim_t batchCount = 1;
+    for (size_t idx = 0; idx < batchDims; ++idx) {
+      batchCount *= dataDims[idx];
+    }
+
+    // Compute input slice count.
+    dim_t inpSliceCount = 1;
+    for (size_t idx = batchDims; idx < batchDims + indicesDimLast; ++idx) {
+      inpSliceCount *= dataDims[idx];
+    }
+
+    // Compute output slice count.
+    dim_t outSliceCount = 1;
+    for (size_t idx = batchDims; idx < indicesDims.size() - 1; ++idx) {
+      outSliceCount *= indicesDims[idx];
+    }
+
+    // Compute slice size (in bytes).
+    dim_t sliceSize = data->getType()->getElementSize();
+    for (size_t idx = batchDims + indicesDimLast; idx < dataDims.size();
+         idx++) {
+      sliceSize *= dataDims[idx];
+    }
+
+    // Get indices dimension products.
+    std::vector<dim_t> indicesDimProd(indicesDimLast);
+    indicesDimProd[indicesDimLast - 1] = 1;
+    for (ssize_t idx = static_cast<ssize_t>(indicesDimLast) - 2; idx >= 0;
+         idx--) {
+      indicesDimProd[idx] =
+          indicesDimProd[idx + 1] * dataDims[batchDims + idx + 1];
+    }
+
+    // Emit pointers.
+    auto *destPtr = emitValueAddress(builder, dest);
+    auto *dataPtr = emitValueAddress(builder, data);
+    auto *indicesPtr = emitValueAddress(builder, indices);
+
+    // Emit parameters.
+    auto *batchCountArg = emitConstDimT(builder, batchCount);
+    auto *inpSliceCountArg = emitConstDimT(builder, inpSliceCount);
+    auto *outSliceCountArg = emitConstDimT(builder, outSliceCount);
+    auto *sliceSizeArg = emitConstDimT(builder, sliceSize);
+    auto *indicesDimLastArg = emitConstDimT(builder, indicesDimLast);
+    auto *indicesDimProdArg =
+        emitConstDimTArray(builder, llvm::makeArrayRef(indicesDimProd));
+
+    llvm::Function *F = getFunction(
+        "gather_nd", {data->getElementType(), indices->getElementType()});
+    createCall(builder, F,
+               {destPtr, dataPtr, indicesPtr, batchCountArg, inpSliceCountArg,
+                outSliceCountArg, sliceSizeArg, indicesDimLastArg,
+                indicesDimProdArg});
     break;
   }
 
@@ -3404,31 +3504,6 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
     break;
   }
 
-  case Kinded::Kind::SparseToDenseInstKind: {
-    auto *STDI = llvm::cast<SparseToDenseInst>(I);
-    auto *indices = STDI->getIndices();
-    auto *values = STDI->getValues();
-    auto *dest = STDI->getDest();
-
-    auto *indicesPtr = emitValueAddress(builder, indices);
-    auto *valuesPtr = emitValueAddress(builder, values);
-    auto *destPtr = emitValueAddress(builder, dest);
-
-    auto *indicesSize = emitConstDimT(builder, indices->size());
-    auto *destSize = emitConstDimT(builder, dest->size());
-
-    auto *valuesType = values->getType();
-    auto *valueSize =
-        emitConstDimT(builder, valuesType->size() / valuesType->dims()[0]);
-
-    auto *F = getFunction("sparse_to_dense",
-                          {dest->getElementType(), indices->getElementType()});
-    createCall(
-        builder, F,
-        {destPtr, indicesPtr, valuesPtr, indicesSize, destSize, valueSize});
-    break;
-  }
-
   case Kinded::Kind::DebugPrintInstKind: {
     auto *DPI = llvm::cast<DebugPrintInst>(I);
     auto *src = DPI->getSrc();
@@ -3662,6 +3737,75 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
                 indicesDimVal, indicesDimSizeVal, centerPointBoxVal,
                 maxBoxesPerClassVal, iouThresholdVal, scoreThresholdVal,
                 isV4Val});
+    break;
+  }
+
+  case Kinded::Kind::TFLiteDetectionPostProcessInstKind: {
+    auto *DPPI = llvm::cast<TFLiteDetectionPostProcessInst>(I);
+    auto boxes = DPPI->getBoxes();
+    auto scores = DPPI->getScores();
+    auto anchors = DPPI->getAnchors();
+    auto detectionBoxes = DPPI->getDetectionBoxes();
+    auto detectionClasses = DPPI->getDetectionClasses();
+    auto detectionScores = DPPI->getDetectionScores();
+    auto numDetections = DPPI->getNumDetections();
+    auto scratch = DPPI->getScratch();
+
+    // Emit pointers.
+    auto *boxesPtr = emitValueAddress(builder, boxes);
+    auto *scoresPtr = emitValueAddress(builder, scores);
+    auto *anchorsPtr = emitValueAddress(builder, anchors);
+    auto *detectionBoxesPtr = emitValueAddress(builder, detectionBoxes);
+    auto *detectionClassesPtr = emitValueAddress(builder, detectionClasses);
+    auto *detectionScoresPtr = emitValueAddress(builder, detectionScores);
+    auto *numDetectionsPtr = emitValueAddress(builder, numDetections);
+    auto *scratchPtr = emitValueAddress(builder, scratch);
+
+    // Emit parameters.
+    auto *numBoxes = emitConstI32(builder, boxes->dims()[1]);
+    auto *numTotalClasses = emitConstI32(builder, scores->dims()[2]);
+    auto *numClasses = emitConstI32(builder, DPPI->getNumClasses());
+    auto *maxDetections = emitConstI32(builder, DPPI->getMaxDetections());
+    auto *maxClassesPerDetection =
+        emitConstI32(builder, DPPI->getMaxClassesPerDetection());
+    auto *maxDetectionsPerClass =
+        emitConstI32(builder, DPPI->getMaxDetectionsPerClass());
+    auto *iouThreshold = emitConstF32(builder, DPPI->getIouThreshold());
+    auto *scoreThreshold = emitConstF32(builder, DPPI->getScoreThreshold());
+    auto *xScaleInv = emitConstF32(builder, 1.0f / DPPI->getXScale());
+    auto *yScaleInv = emitConstF32(builder, 1.0f / DPPI->getYScale());
+    auto *hScaleInv = emitConstF32(builder, 1.0f / DPPI->getHScale());
+    auto *wScaleInv = emitConstF32(builder, 1.0f / DPPI->getWScale());
+    auto *regularNMS = emitConstI1(builder, DPPI->getRegularNMS());
+
+    // Current implementation only supports batch size 1.
+    assert(boxes->dims()[0] == 1 &&
+           "TFLiteDetectionPostProcess batch not supported!");
+
+    // Call function.
+    auto *F = getFunction("tflite_detection_post_process_f");
+    createCall(builder, F,
+               {boxesPtr,
+                scoresPtr,
+                anchorsPtr,
+                detectionBoxesPtr,
+                detectionClassesPtr,
+                detectionScoresPtr,
+                numDetectionsPtr,
+                scratchPtr,
+                numBoxes,
+                numTotalClasses,
+                numClasses,
+                maxDetections,
+                maxClassesPerDetection,
+                maxDetectionsPerClass,
+                iouThreshold,
+                scoreThreshold,
+                xScaleInv,
+                yScaleInv,
+                hScaleInv,
+                wScaleInv,
+                regularNMS});
     break;
   }
 

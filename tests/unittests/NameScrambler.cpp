@@ -1,3 +1,19 @@
+/**
+ * Copyright (c) Glow Contributors. See CONTRIBUTORS file.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "glow/Support/ZipUtils.h"
 #include "onnx/onnx_pb.h"
 
@@ -129,7 +145,11 @@ bool parseIO(const std::string &filename, ::ONNX_NAMESPACE::GraphProto &g) {
   }
   google::protobuf::io::IstreamInputStream fileStream(&ff);
   google::protobuf::io::CodedInputStream codedStream(&fileStream);
+#if GOOGLE_PROTOBUF_VERSION >= 3002000
+  codedStream.SetTotalBytesLimit(MAX_PROTO_SIZE);
+#else
   codedStream.SetTotalBytesLimit(MAX_PROTO_SIZE, MAX_PROTO_SIZE);
+#endif
   bool yes = g.ParseFromCodedStream(&codedStream);
   if (!yes) {
     return false;

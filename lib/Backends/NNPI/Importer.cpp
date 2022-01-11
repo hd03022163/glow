@@ -14,6 +14,8 @@
  */
 
 #include "Importer.h"
+#include "CustomKernels/DSPInjectors/DSPInjectors.h"
+#include "CustomKernels/IAInjectors/IAInjectors.h"
 #include "DebugMacros.h"
 #include "NNPI.h"
 #include "glow/Flags/Flags.h"
@@ -21,9 +23,7 @@
 #include "glow/IR/Instrs.h"
 #include "glow/Quantization/Base/Base.h"
 #include "glow/Quantization/Quantization.h"
-#include "glow/include/glow/Support/Error.h"
-#include "glow/lib/Backends/NNPI/CustomKernels/DSPInjectors/DSPInjectors.h"
-#include "glow/lib/Backends/NNPI/CustomKernels/IAInjectors/IAInjectors.h"
+#include "glow/Support/Error.h"
 #include "nnpi_transformer.h"
 #include <cmath>
 #include <cstdio>
@@ -53,7 +53,7 @@ static bool isBatchNormUsingAlternativeLayout(const glow::Node *node,
 
 static std::string nodeValueName(const glow::NodeValue &nv) {
   if (nv.getNode()->getKind() == glow::Kinded::Kind::PlaceholderKind) {
-    return nv.getNode()->getName();
+    return nv.getNode()->getName().str();
   } else if (nv.getNode()->getKind() == glow::Kinded::Kind::ConstantKind) {
     return std::string(nv.getNode()->getName()) + std::string("__const");
   }
@@ -168,7 +168,7 @@ NNPIErrorCode glow::NNPIImporter::addValueIfTensor(Value *v) {
   auto *weight = llvm::dyn_cast<WeightVar>(v);
   if (weight &&
       weight->getMutability() == WeightVar::MutabilityKind::Constant &&
-      constants_.count(v->getName())) {
+      constants_.count(v->getName().str())) {
     // Add a tensor.
     return addTensor(v->getName().begin());
   }
@@ -458,6 +458,19 @@ glow::NNPIImporter::addIAExtentionPath(const std::string &extPath) {
   return NNPI_NO_ERROR;
 }
 
+NNPIErrorCode glow::NNPIImporter::addIAExtentionLib(const std::string libName,
+                                                    const char *pLib,
+                                                    size_t sizeLib) {
+  LOG_AND_RETURN_IF(
+      ERROR, (pLib == nullptr || sizeLib == 0),
+      strFormat("Check if IA extension lib is of 0 size or pointer is Null"),
+      NNPI_INVALID_PARAM);
+
+  std::vector<char> libContents(pLib, pLib + sizeLib);
+  iaExtensionLibs_.push_back(std::make_pair(libName, libContents));
+  return NNPI_NO_ERROR;
+}
+
 /// Replaces any operators in the Function \p F with custom DSP NNPI kernel
 /// operators by calling each CustomKernelInjector on each node in sequence.
 /// \returns true iff any custom NNPI node was injected into the Function.
@@ -556,9 +569,11 @@ getReplacementMap(Function *F) {
   const char *useInfApi = std::getenv("USE_INF_API");
   if (!glow::nnpi::flags::EnableCustomIAKernels) {
     LOG(INFO) << "Skipping custom IA kernels because they are disabled";
+#if NNPI_MAJOR_VERSION >= 1 && NNPI_MINOR_VERSION < 7
   } else if (!useInfApi || std::string(useInfApi) != "1") {
     LOG(INFO) << "Skipping custom IA kernels because hardware inference isn't "
                  "enabled";
+#endif // NNPI < 1.7
   } else {
     LOG(INFO) << "Custom IA ops enabled";
     static const auto iaInjectors = buildIAInjectors();
@@ -578,11 +593,12 @@ getReplacementMap(Function *F) {
 NNPINetwork glow::NNPIImporter::importFunction(Function *F,
                                                const BackendOptions &opts,
                                                bool &requiresDSPKernels) {
+  requiresDSPKernels = false;
   if (compileOptions_.normalizeLayerNames) {
     std::map<std::string, uint32_t> type2count;
     std::map<std::string, glow::Node *> nodes;
     for (auto &N : F->getNodes()) {
-      nodes[N.getName()] = &N;
+      nodes[N.getName().str()] = &N;
     }
     auto *module = F->getParent();
     std::string prefix;
@@ -721,13 +737,13 @@ NNPINetwork glow::NNPIImporter::importFunction(Function *F,
 
   // Handle placeholders (inputs/outputs).
   for (auto *v : F->getParent()->getPlaceholders()) {
-    bool inputVar(readTensors_.count(v->getName()) &&
-                  !writeTensors_.count(v->getName()));
-    bool outputVar(!readTensors_.count(v->getName()) &&
-                   writeTensors_.count(v->getName()));
+    bool inputVar(readTensors_.count(v->getName().str()) &&
+                  !writeTensors_.count(v->getName().str()));
+    bool outputVar(!readTensors_.count(v->getName().str()) &&
+                   writeTensors_.count(v->getName().str()));
     if (inputVar || outputVar) {
       LOG_NNPI_IF_ERROR_RETURN_INVALID_HANDLE(
-          addValue(v->getName(), v->getType(),
+          addValue(v->getName().str(), v->getType(),
                    isVariableUsingAlternativeLayout(v), inputVar, outputVar),
           "Failed to add placeholder");
       DBG("[--IO--] Setting IO variable: " << v->getName().str() << ", R:"
@@ -1053,12 +1069,12 @@ public:
     // Overwrite input/output values for layout.
     const auto *input = glowFC->getInput().getNode();
     LOG_NNPI_IF_ERROR_RETURN_VALUE(
-        importer.addValue(input->getName(), input->getType(0),
+        importer.addValue(input->getName().str(), input->getType(0),
                           input->getType(0)->dims().size() == 4),
         "Failed to add tensor to NNPI");
     const auto *result = glowFC->getResult().getNode();
     LOG_NNPI_IF_ERROR_RETURN_VALUE(
-        importer.addValue(result->getName(), result->getType(0),
+        importer.addValue(result->getName().str(), result->getType(0),
                           result->getType(0)->dims().size() == 4),
         "Failed to add tensor to NNPI");
 
@@ -1091,6 +1107,28 @@ public:
         nodeValueName(glowSD->getIndices()).c_str(),
         nodeValueName(glowSD->getSlices()).c_str(),
         nodeValueName(glowSD->getResult()).c_str(), glowSD->getCumulative());
+  }
+};
+
+class BucketizeNodeImporter : public INNPINodeImporter {
+public:
+  NNPIErrorCode importNode(Node *n, NNPIImporter &importer) override {
+    auto *glowBucketize = llvm::dyn_cast<BucketizeNode>(n);
+    LOG_AND_RETURN_IF_NOT(ERROR, glowBucketize, "Bad node type",
+                          NNPI_INVALID_PARAM);
+
+    importer.setUsedTensors({nodeValueName(glowBucketize->getInput())},
+                            {nodeValueName(glowBucketize->getResult())});
+
+    std::vector<float> bucketizeBoundaries(
+        glowBucketize->getBoundaries().begin(),
+        glowBucketize->getBoundaries().end());
+
+    return nnpiNetworkAddBucketizeOp(
+        importer.getNetwork(), glowBucketize->getName().begin(),
+        nodeValueName(glowBucketize->getInput()).c_str(),
+        nodeValueName(glowBucketize->getResult()).c_str(),
+        bucketizeBoundaries.data(), bucketizeBoundaries.size());
   }
 };
 
@@ -2396,13 +2434,40 @@ public:
     outputTensors.insert(nvName);
 
     importer.setUsedTensors(inputTensors, outputTensors);
+
     NNPIErrorCode error = importer.addIAExtentionPath(glowIA->getIAPath());
+#if NNPI_MAJOR_VERSION >= 1 && NNPI_MINOR_VERSION >= 8
+    if (error != NNPI_NO_ERROR) {
+      error = importer.addIAExtentionLib(
+          glowIA->getKernelName(), (const char *)glowIA->getPointerToIALib(),
+          glowIA->getSizeOfIALib());
+      LOG_AND_RETURN_IF_NOT(ERROR, error == NNPI_NO_ERROR,
+                            "Failed to store IA extension", NNPI_INVALID_PARAM);
+    }
+#else
     LOG_AND_RETURN_IF_NOT(ERROR, error == NNPI_NO_ERROR,
                           "Failed to store IA extension", NNPI_INVALID_PARAM);
+#endif // NNPI >= 1.8
+#if NNPI_MAJOR_VERSION >= 1 && NNPI_MINOR_VERSION >= 7
+    const auto *kpConstant =
+        glowIA->getParent()->getParent()->getConstantByName(
+            glowIA->getKernelParams().getNode()->getName());
+    LOG_AND_RETURN_IF_NOT(ERROR, kpConstant, "Kernel Params must be constant",
+                          NNPI_INVALID_PARAM);
+    const Tensor *kpTensor = &kpConstant->getPayload();
 
+    auto res = nnpiNetworkAddCustomIAOp(
+        importer.getNetwork(), nodeName.begin(), numInputs, inputs, numOutputs,
+        outputs, glowIA->getKernelName().c_str(), kpTensor->getUnsafePtr(),
+        kpTensor->getSizeInBytes(),
+        reinterpret_cast<const NNPICustomIAIceRefCallback>(
+            glowIA->getICERefCallback()));
+#else
     auto res = nnpiNetworkAddCustomIAOp(importer.getNetwork(), nodeName.begin(),
                                         numInputs, inputs, numOutputs, outputs,
                                         glowIA->getKernelName().c_str());
+#endif // NNPI_MAJOR_VERSION >= 1 && NNPI_MINOR_VERSION >= 7
+
     return res;
   }
 };
@@ -2840,7 +2905,112 @@ public:
         /* alignCorners */ false, /* halfPixelCenters */ false);
   }
 };
+
+class SparseLabelSplitNodeImporter : public INNPINodeImporter {
+public:
+  NNPIErrorCode importNode(Node *n, NNPIImporter &importer) override {
+    auto *glowSpLabSplitNode = llvm::dyn_cast<SparseLabelSplitNode>(n);
+    LOG_AND_RETURN_IF_NOT(ERROR, glowSpLabSplitNode, "Bad node type",
+                          NNPI_INVALID_PARAM);
+
+    importer.setUsedTensors(
+        {nodeValueName(glowSpLabSplitNode->getLengths()),
+         nodeValueName(glowSpLabSplitNode->getIndices()),
+         nodeValueName(glowSpLabSplitNode->getValues())},
+        {nodeValueName(glowSpLabSplitNode->getLabelValues()),
+         nodeValueName(glowSpLabSplitNode->getExampleIds()),
+         nodeValueName(glowSpLabSplitNode->getGradientOffsetMap())});
+
+    return nnpiNetworkSparseLabelSplitOp(
+        importer.getNetwork(), glowSpLabSplitNode->getName().begin(),
+        nodeValueName(glowSpLabSplitNode->getLengths()).c_str(),
+        nodeValueName(glowSpLabSplitNode->getIndices()).c_str(),
+        nodeValueName(glowSpLabSplitNode->getValues()).c_str(),
+        nodeValueName(glowSpLabSplitNode->getLabelValues()).c_str(),
+        nodeValueName(glowSpLabSplitNode->getExampleIds()).c_str(),
+        nodeValueName(glowSpLabSplitNode->getGradientOffsetMap()).c_str(),
+        glowSpLabSplitNode->getNumLabels(), /* keepGradientOffsetMap */ true);
+  }
+};
 #endif // NNPI >= 1.1
+
+#if NNPI_MAJOR_VERSION >= 1 && NNPI_MINOR_VERSION >= 7
+class CumSumNodeImporter : public INNPINodeImporter {
+public:
+  NNPIErrorCode importNode(Node *n, NNPIImporter &importer) override {
+    auto *glowCumSumNode = llvm::dyn_cast<CumSumNode>(n);
+    LOG_AND_RETURN_IF_NOT(ERROR, glowCumSumNode, "Bad CumSum node type",
+                          NNPI_INVALID_PARAM);
+
+    importer.setUsedTensors({nodeValueName(glowCumSumNode->getInput())},
+                            {nodeValueName(glowCumSumNode->getResult())});
+
+    int32_t axis = (int32_t)glowCumSumNode->getDim();
+    auto exclusive = glowCumSumNode->getExclusive();
+    auto reverse = glowCumSumNode->getReverse();
+
+    return nnpiNetworkAddCumsumOp(
+        importer.getNetwork(), glowCumSumNode->getName().begin(),
+        nodeValueName(glowCumSumNode->getInput()).c_str(),
+        nodeValueName(glowCumSumNode->getResult()).c_str(), axis, exclusive,
+        reverse);
+  }
+};
+#endif // NNPI >= 1.7
+
+#if NNPI_MAJOR_VERSION >= 1 && NNPI_MINOR_VERSION >= 9
+class BatchSparseToDenseNodeImporter : public INNPINodeImporter {
+public:
+  NNPIErrorCode importNode(Node *n, NNPIImporter &importer) override {
+    auto *glowBatchSparseToDenseNode =
+        llvm::dyn_cast<BatchSparseToDenseNode>(n);
+    LOG_AND_RETURN_IF_NOT(ERROR, glowBatchSparseToDenseNode,
+                          "Bad BatchSparseToDense node type",
+                          NNPI_INVALID_PARAM);
+
+    importer.setUsedTensors(
+        {nodeValueName(glowBatchSparseToDenseNode->getLengths()),
+         nodeValueName(glowBatchSparseToDenseNode->getIndices()),
+         nodeValueName(glowBatchSparseToDenseNode->getValues())},
+        {nodeValueName(glowBatchSparseToDenseNode->getResult())});
+
+    auto defaultValue = glowBatchSparseToDenseNode->getDefaultValue();
+    auto denseLastDim = glowBatchSparseToDenseNode->getDenseLastDim();
+
+    return nnpiNetworkAddBatchSparseToDenseOp(
+        importer.getNetwork(), glowBatchSparseToDenseNode->getName().begin(),
+        nodeValueName(glowBatchSparseToDenseNode->getLengths()).c_str(),
+        nodeValueName(glowBatchSparseToDenseNode->getIndices()).c_str(),
+        nodeValueName(glowBatchSparseToDenseNode->getValues()).c_str(),
+        nodeValueName(glowBatchSparseToDenseNode->getResult()).c_str(),
+        denseLastDim, defaultValue);
+  }
+};
+
+class FillExamplesWithIndicatorNodeImporter : public INNPINodeImporter {
+public:
+  NNPIErrorCode importNode(Node *n, NNPIImporter &importer) override {
+    auto *glowFillExamplesWithIndicatorNode =
+        llvm::dyn_cast<FillExamplesWithIndicatorNode>(n);
+    LOG_AND_RETURN_IF_NOT(ERROR, glowFillExamplesWithIndicatorNode,
+                          "Bad FillExamplesWithIndicator node type",
+                          NNPI_INVALID_PARAM);
+
+    importer.setUsedTensors(
+        {nodeValueName(glowFillExamplesWithIndicatorNode->getData()),
+         nodeValueName(glowFillExamplesWithIndicatorNode->getIndicator())},
+        {nodeValueName(glowFillExamplesWithIndicatorNode->getResult())});
+
+    return nnpiNetworkAddFillExamplesWithIndicatorOp(
+        importer.getNetwork(),
+        glowFillExamplesWithIndicatorNode->getName().begin(),
+        nodeValueName(glowFillExamplesWithIndicatorNode->getData()).c_str(),
+        nodeValueName(glowFillExamplesWithIndicatorNode->getIndicator())
+            .c_str(),
+        nodeValueName(glowFillExamplesWithIndicatorNode->getResult()).c_str());
+  }
+};
+#endif // NNPI >= 1.9
 
 //////////////////////////////////////////////////////////////////////////
 namespace {
@@ -2864,6 +3034,7 @@ std::unordered_map<
     {"SoftPlus", glow::make_unique<SoftPlusNodeImporter>()},
     {"SoftMax", glow::make_unique<SoftMaxNodeImporter>()},
     {"ScatterData", glow::make_unique<ScatterDataNodeImporter>()},
+    {"Bucketize", glow::make_unique<BucketizeNodeImporter>()},
     {"Save", glow::make_unique<SaveNodeImporter>()},
     {"Relu", glow::make_unique<ReluNodeImporter>()},
     {"PRelu", glow::make_unique<PReluNodeImporter>()},
@@ -2888,9 +3059,16 @@ std::unordered_map<
                 BinaryEltwiseNodeImporter<glow::SubNode, NNPI_ELTWISE_SUB>>()},
     {"Pow", glow::make_unique<
                 BinaryEltwiseNodeImporter<glow::PowNode, NNPI_ELTWISE_POW>>()},
+#if NNPI_MAJOR_VERSION >= 1 && NNPI_MINOR_VERSION >= 7
+    {"Fmod",
+     glow::make_unique<
+         BinaryEltwiseNodeImporter<glow::FmodNode, NNPI_ELTWISE_MODULO>>()},
+    {"CumSum", glow::make_unique<CumSumNodeImporter>()},
+#else
     {"Fmod",
      glow::make_unique<
          BinaryEltwiseNodeImporter<glow::FmodNode, NNPI_ELTWISE_FLOOR_MOD>>()},
+#endif // NNPI >= 1.7
     {"CmpEQ",
      glow::make_unique<
          BinaryEltwiseNodeImporter<glow::CmpEQNode, NNPI_ELTWISE_EQ>>()},
@@ -2900,6 +3078,11 @@ std::unordered_map<
     {"CmpLT",
      glow::make_unique<
          BinaryEltwiseNodeImporter<glow::CmpLTNode, NNPI_ELTWISE_LESS>>()},
+#if NNPI_MAJOR_VERSION >= 1 && NNPI_MINOR_VERSION >= 8
+    {"CmpNEQ",
+     glow::make_unique<
+         BinaryEltwiseNodeImporter<glow::CmpNEQNode, NNPI_ELTWISE_NEQ>>()},
+#endif // NNPI >= 1.8
     {"ArgMax", glow::make_unique<ArgMaxNodeImporter>()},
     {"ArgMin", glow::make_unique<ArgMinNodeImporter>()},
     {"Reshape", glow::make_unique<ReshapeNodeImporter>()},
@@ -2977,7 +3160,13 @@ std::unordered_map<
      glow::make_unique<DynamicQuantizedFullyConnectedNodeImporter>()},
     {"DynamicRowwiseQuantizedFullyConnected",
      glow::make_unique<DynamicRowwiseQuantizedFullyConnectedNodeImporter>()},
+    {"SparseLabelSplit", glow::make_unique<SparseLabelSplitNodeImporter>()},
 #endif // NNPI >= 1.1
+#if NNPI_MAJOR_VERSION >= 1 && NNPI_MINOR_VERSION >= 9
+    {"BatchSparseToDense", glow::make_unique<BatchSparseToDenseNodeImporter>()},
+    {"FillExamplesWithIndicator",
+     glow::make_unique<FillExamplesWithIndicatorNodeImporter>()},
+#endif // NNPI >= 1.9
 };
 } // namespace
 
